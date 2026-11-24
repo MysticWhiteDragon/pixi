@@ -1,0 +1,495 @@
+/*
+ * pixi-shell GPU programs, GLSL ES 3.00.
+ *
+ * Ported from LineXinBar's crates/lxb-desktop/src/shaders.wgsl (GPL-3.0-only):
+ * the wallpaper (light fields, aurora veils, the silk and water currents,
+ * vignette, the guide's softening) and the quad material (rounded panes of
+ * glass that refract the wallpaper behind them, the reflective rim, and the
+ * glyphs shaded as beads of water out of their own distance fields).
+ *
+ * Everything is computed in linear light and drawn into sRGB render targets;
+ * the final pass encodes for the display.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+#ifndef PIXI_SHADERS_H
+#define PIXI_SHADERS_H
+
+#define GLSL_HEADER "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+
+/* ------------------------------------------------------------------------ */
+/* Shared pieces                                                            */
+/* ------------------------------------------------------------------------ */
+
+#define GLSL_COMMON \
+"uniform vec2 u_res;\n" \
+"uniform float u_time;\n" \
+"uniform float u_blur;\n" \
+"uniform vec3 u_sky[4];\n" \
+"uniform vec3 u_accent[3];\n" \
+"uniform vec3 u_glow;\n" \
+"uniform vec4 u_style;\n" \
+"const vec3 KEY_LIGHT = vec3(-0.42, -0.66, 0.62);\n" \
+"const float PI = 3.14159265;\n" \
+"const float BAND_FOLD = 0.020;\n" \
+"const float BAND_BOW = 0.50;\n" \
+"const float BAND_SHARE = 0.88;\n" \
+"const float BAND_EDGE_SAMPLES = 0.8;\n" \
+"const float GLASS_IOR = 1.47;\n" \
+"const float GLASS_DISPERSION = 0.055;\n" \
+"const float GLASS_FLOAT = 1.0;\n" \
+"const float BACKDROP_LEVELS = 4.0;\n" \
+"const vec3 FROST_SCATTER = vec3(0.030, 0.029, 0.046);\n" \
+"float corner_norm(vec2 v, float power) {\n" \
+"  if (power <= 2.0) return length(v);\n" \
+"  return pow(pow(v.x, power) + pow(v.y, power), 1.0 / power);\n" \
+"}\n" \
+"float rounded_box(vec2 p, vec2 half_size, float radius, float power) {\n" \
+"  float r = min(radius, min(half_size.x, half_size.y));\n" \
+"  vec2 q = abs(p) - half_size + vec2(r);\n" \
+"  return corner_norm(max(q, vec2(0.0)), power) + min(max(q.x, q.y), 0.0) - r;\n" \
+"}\n" \
+"float rounded_coverage(vec2 px, vec4 rect, float radius) {\n" \
+"  vec2 h = rect.zw * 0.5;\n" \
+"  float d = rounded_box(px - (rect.xy + h), h, radius, 2.0);\n" \
+"  return 1.0 - smoothstep(-0.75, 0.75, d);\n" \
+"}\n" \
+"float bevel_rise(float inset) { return sqrt(max(1.0 - (1.0 - inset) * (1.0 - inset), 0.0)); }\n" \
+"float bevel_slope(float inset) { return (1.0 - inset) / max(bevel_rise(inset), 0.16); }\n"
+
+/* ------------------------------------------------------------------------ */
+/* Background                                                               */
+/* ------------------------------------------------------------------------ */
+
+static const char *VS_FULLSCREEN =
+GLSL_HEADER
+"out vec2 v_uv;\n"
+"void main() {\n"
+"  vec2 p = vec2(gl_VertexID == 2 ? 3.0 : -1.0, gl_VertexID == 0 ? -3.0 : 1.0);\n"
+"  gl_Position = vec4(p, 0.0, 1.0);\n"
+"  v_uv = vec2((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);\n"
+"}\n";
+
+static const char *FS_BACKGROUND =
+GLSL_HEADER
+GLSL_COMMON
+"in vec2 v_uv;\n"
+"out vec4 frag;\n"
+"const float SPINE_REST = 0.62;\n"
+"float ambient_field(vec2 p, vec2 c, vec2 r) { vec2 q = (p - c) / r; return exp(-dot(q, q) * 1.65); }\n"
+"struct Spine { float gather; float height; float slope; };\n"
+"Spine spine_at(float u, float t, float aspect) {\n"
+"  float gather = 0.28 + 0.72 * sin(PI * u);\n"
+"  float gather_slope = 0.72 * PI * cos(PI * u);\n"
+"  float a = u * 6.8 + t * 0.56;\n"
+"  float b = u * 3.4 - t * 0.39 + 0.8;\n"
+"  float swing = sin(a) * 0.055 + sin(b) * 0.085;\n"
+"  float swing_slope = cos(a) * 0.055 * 6.8 + cos(b) * 0.085 * 3.4;\n"
+"  Spine s; s.gather = gather; s.height = SPINE_REST + swing * gather;\n"
+"  s.slope = (swing_slope * gather + swing * gather_slope) / aspect;\n"
+"  return s;\n"
+"}\n"
+/* The band of water: three ribbons along one spine (the full material). */
+"vec3 water(vec3 into, vec2 uv, float aspect, float t, float soften, vec2 footprint, Spine spine) {\n"
+"  vec3 color = into;\n"
+"  float lip = 0.45;\n"
+"  float ribbon_gloss = mix(1.0, 0.10, soften);\n"
+"  float ribbon_wave = mix(1.0, 0.25, soften);\n"
+"  vec3 key = normalize(KEY_LIGHT);\n"
+"  vec3 half_vector = normalize(key + vec3(0.0, 0.0, 1.0));\n"
+"  float gather = spine.gather;\n"
+"  float slope = spine.slope;\n"
+"  vec2 across = normalize(vec2(slope, -1.0));\n"
+"  vec2 along = vec2(-across.y, across.x);\n"
+"  float band = (uv.y - spine.height) / sqrt(1.0 + slope * slope);\n"
+"  float samp = abs(across.x * footprint.x * aspect) + abs(across.y * footprint.y);\n"
+"  float tilt[3]; float width[3];\n"
+"  for (int i = 0; i < 3; i++) {\n"
+"    float fi = float(i);\n"
+"    float x = uv.x * (2.0 + fi * 0.6);\n"
+"    float turning = sin(x * 2.10 - t * (0.23 + fi * 0.05) + fi * 1.9) * 0.95\n"
+"        + sin(x * 1.25 + t * 0.15 + fi * 2.7) * 0.55\n"
+"        + sin(x * 4.30 - t * 0.35 + fi * 0.7) * 0.22;\n"
+"    tilt[i] = (turning * abs(turning) * 0.62 + sin(x * 7.0 + t * 0.9 + fi) * 0.08) * ribbon_wave;\n"
+"    float broad = sqrt(cos(tilt[i]) * cos(tilt[i]) + BAND_FOLD);\n"
+"    width[i] = (0.0640 - 0.0110 * fi) * broad * mix(1.0, 1.5, soften);\n"
+"  }\n"
+"  float lift = BAND_SHARE * (0.32 + 0.68 * sin(uv.x * 4.3 - t * 0.37));\n"
+"  float drop = BAND_SHARE * (0.32 + 0.68 * sin(uv.x * 3.1 + t * 0.29 + 2.2));\n"
+"  float offs[3];\n"
+"  offs[0] = -(width[0] + width[1]) * lift * gather; offs[1] = 0.0; offs[2] = (width[1] + width[2]) * drop * gather;\n"
+"  for (int i = 0; i < 3; i++) {\n"
+"    float fi = float(i);\n"
+"    float x = uv.x * (2.0 + fi * 0.6);\n"
+"    float d = band - offs[i];\n"
+"    float sw = width[i];\n"
+"    float along_wave = (cos(x * 9.0 - t * 1.1 + fi * 2.0) * 0.34 + cos(x * 23.0 + t * 1.9 + fi * 1.3) * 0.14) * ribbon_wave;\n"
+"    float reach = abs(d / sw);\n"
+"    float s_across = clamp(d / sw, -1.0, 1.0);\n"
+"    float spread = BAND_EDGE_SAMPLES * samp / sw;\n"
+"    float cover = 1.0 - smoothstep(mix(0.94, 0.40, soften) - spread, 1.0 + spread, reach);\n"
+"    float inset = clamp((1.0 - reach) / lip, 0.0, 1.0);\n"
+"    float rise = bevel_rise(inset);\n"
+"    vec2 wall = normalize(vec2(-sign(d) * bevel_slope(inset) - s_across * BAND_BOW, 1.0));\n"
+"    float turn = sin(tilt[i]); float level = cos(tilt[i]);\n"
+"    vec2 face = vec2(wall.x * level + wall.y * turn, wall.y * level - wall.x * turn);\n"
+"    float broad = sqrt(level * level + BAND_FOLD);\n"
+"    float fold = min(1.0 / broad, 2.2);\n"
+"    vec3 surface = normalize(vec3(across * face.x + along * along_wave * face.y, face.y));\n"
+"    float facing = clamp(dot(surface, key), 0.0, 1.0);\n"
+"    float fresnel = 0.04 + 0.96 * pow(1.0 - clamp(surface.z, 0.0, 1.0), 5.0);\n"
+"    float glint = pow(max(dot(surface, half_vector), 0.0), 42.0);\n"
+"    vec3 mirrored = reflect(vec3(0.0, 0.0, -1.0), surface);\n"
+"    float room = 0.42 + 0.73 * (0.5 - 0.5 * dot(mirrored, key));\n"
+"    float travelling = 0.60 + 0.40 * sin(x * 3.1 - t * (0.9 + fi * 0.25) + fi);\n"
+"    float focusing = 0.5 + 0.5 * sin(x * 2.3 - t * 0.5 + fi);\n"
+"    float gathered = pow(max(sin(x * 23.0 + t * 1.9 + fi * 1.3 + s_across * 3.4), 0.0), 5.0) * (0.15 + 0.85 * focusing * focusing);\n"
+"    float depth = 1.0 - fi * 0.26;\n"
+"    float skirt = exp(-d * d * mix(90.0, 45.0, soften));\n"
+"    float shadow_d = d - sw - 0.010;\n"
+"    float shadow = exp(-shadow_d * shadow_d * mix(1400.0, 500.0, soften)) * (1.0 - cover);\n"
+"    float caustic_d = d - sw - 0.0040;\n"
+"    float caustic = exp(-caustic_d * caustic_d * mix(30000.0, 2000.0, soften)) * broad;\n"
+"    vec3 haze_tint = mix(u_accent[0], u_accent[2], 0.46);\n"
+"    vec3 body_tint = mix(u_accent[0], u_accent[2], 0.24 + fi * 0.05 + 0.36 * rise);\n"
+"    float split = GLASS_DISPERSION * (1.0 - inset) * (1.0 - inset) * cover * depth * ribbon_gloss * -sign(d);\n"
+"    float haze_strength = mix(1.0, 0.40, soften) * depth;\n"
+"    float body_strength = mix(1.0, 0.55, soften) * depth;\n"
+"    float w = cover * fold * body_strength;\n"
+"    color *= 1.0 - cover * (0.05 + 0.11 * rise) * body_strength;\n"
+"    color *= 1.0 - shadow * 0.20 * body_strength;\n"
+"    color += haze_tint * skirt * 0.007 * haze_strength;\n"
+"    color += body_tint * w * (0.005 + 0.012 * rise + 0.028 * facing);\n"
+"    color += u_accent[1] * fresnel * room * w * 0.100 * mix(1.0, 0.45, soften);\n"
+"    color += u_accent[1] * glint * w * 0.120 * travelling * ribbon_gloss;\n"
+"    color += u_accent[1] * gathered * cover * rise * 0.011 * depth * ribbon_gloss;\n"
+"    color += u_accent[1] * caustic * 0.011 * depth * ribbon_gloss;\n"
+"    color *= vec3(1.0 + split, 1.0, 1.0 - split);\n"
+"  }\n"
+"  return color;\n"
+"}\n"
+/* Three fine glass-silk ribbons (LineXinBar's Simple material). */
+"vec3 silk(vec3 into, vec2 uv, float aspect, float t, float soften) {\n"
+"  vec3 color = into;\n"
+"  for (int i = 0; i < 3; i++) {\n"
+"    float fi = float(i);\n"
+"    float speed = 0.42 + fi * 0.14;\n"
+"    float lane = 0.62 + (fi - 1.0) * 0.050;\n"
+"    float x_scale = 2.0 + fi * 0.6;\n"
+"    float x = uv.x * x_scale;\n"
+"    float pa = x * 2.6 + t * speed + fi * 2.1;\n"
+"    float pb = x * 1.3 - t * speed * 0.7 + fi * 0.8;\n"
+"    float center = lane + sin(pa) * 0.055 + sin(pb) * 0.085;\n"
+"    float uv_slope = (cos(pa) * 0.055 * 2.6 + cos(pb) * 0.085 * 1.3) * x_scale;\n"
+"    float slope = uv_slope / aspect;\n"
+"    float d = (uv.y - center) / sqrt(1.0 + slope * slope);\n"
+"    float skirt = exp(-d * d * mix(320.0, 110.0, soften));\n"
+"    float body = exp(-d * d * mix(5200.0, 680.0, soften));\n"
+"    float bevel_d = d + mix(0.0045, 0.012, soften);\n"
+"    float bevel = exp(-bevel_d * bevel_d * mix(20000.0, 1000.0, soften));\n"
+"    float crest_d = d + mix(0.0065, 0.014, soften);\n"
+"    float crest = exp(-crest_d * crest_d * mix(70000.0, 1400.0, soften));\n"
+"    float fold_d = d - mix(0.008, 0.016, soften);\n"
+"    float lower_fold = exp(-fold_d * fold_d * mix(9500.0, 900.0, soften));\n"
+"    vec2 upper_normal = normalize(vec2(slope, -1.0));\n"
+"    float lamp_facing = max(dot(upper_normal, normalize(KEY_LIGHT.xy)), 0.0);\n"
+"    float key_glint = 0.52 + 0.48 * pow(lamp_facing, 4.0);\n"
+"    float travelling = 0.64 + 0.36 * sin(x * 3.1 - t * (0.9 + fi * 0.25) + fi);\n"
+"    float depth = 1.0 - fi * 0.18;\n"
+"    float haze_strength = mix(1.0, 0.40, soften) * depth;\n"
+"    float gloss_strength = mix(1.0, 0.10, soften) * depth;\n"
+"    vec3 haze_tint = mix(u_accent[0], u_accent[2], 0.46);\n"
+"    vec3 body_tint = mix(u_accent[0], u_accent[2], 0.28 + fi * 0.04);\n"
+"    color += haze_tint * skirt * 0.020 * haze_strength;\n"
+"    color += body_tint * body * 0.040 * haze_strength;\n"
+"    color += u_accent[2] * lower_fold * 0.010 * haze_strength;\n"
+"    color += u_accent[1] * (bevel * 0.022 * (0.82 + 0.18 * travelling) + crest * 0.010 * travelling * key_glint) * gloss_strength;\n"
+"  }\n"
+"  return color;\n"
+"}\n"
+"vec3 wallpaper(vec2 uv, float aspect, float t, float soften, vec2 footprint) {\n"
+"  float mood = 0.5 + 0.5 * sin(t * 0.03);\n"
+"  vec3 top = mix(u_sky[0], u_sky[2], mood);\n"
+"  vec3 bottom = mix(u_sky[1], u_sky[3], mood);\n"
+"  float gy = uv.y + sin(uv.x * 2.7 + t * 0.075) * 0.045 + sin(uv.x * 5.3 - t * 0.052) * 0.018;\n"
+"  vec3 color = mix(top, bottom, smoothstep(0.0, 1.0, gy)) * 0.42;\n"
+"  vec2 gc = vec2(0.24, 0.34);\n"
+"  float glow = 1.0 - smoothstep(0.0, 0.8, distance(uv * vec2(aspect, 1.0), gc * vec2(aspect, 1.0)));\n"
+"  color += u_glow * glow * 0.25;\n"
+"  vec2 p = vec2((uv.x - 0.5) * aspect, uv.y - 0.5);\n"
+"  vec2 warp = vec2(sin(p.y * 3.8 + t * 0.11) + sin((p.x + p.y) * 2.1 - t * 0.071),\n"
+"                   sin(p.x * 2.6 - t * 0.093) + sin((p.x - p.y) * 2.4 + t * 0.063)) * 0.035;\n"
+"  vec2 f = p + warp;\n"
+"  float spread = mix(1.0, 1.45, soften);\n"
+"  float deep = ambient_field(f, vec2(-aspect * 0.34 + sin(t * 0.083) * aspect * 0.28, -0.23 + cos(t * 0.067) * 0.18), vec2(aspect * 0.36, 0.34) * spread);\n"
+"  float mainf = ambient_field(f, vec2(aspect * 0.31 + cos(t * 0.061) * aspect * 0.30, 0.20 + sin(t * 0.089) * 0.20), vec2(aspect * 0.34, 0.38) * spread);\n"
+"  float soft = ambient_field(f, vec2(sin(t * 0.047 + 2.0) * aspect * 0.42, sin(t * 0.073 + 1.1) * 0.30), vec2(aspect * 0.40, 0.29) * spread);\n"
+"  float fs = mix(1.0, 0.48, soften);\n"
+"  color += u_accent[2] * deep * 0.16 * fs;\n"
+"  color += u_accent[0] * mainf * 0.085 * fs;\n"
+"  color += u_accent[1] * soft * 0.035 * fs;\n"
+"  float current = sin(f.x * 2.15 + f.y * 1.25 + t * 0.13) + sin(f.x * 0.78 - f.y * 2.35 - t * 0.087);\n"
+"  color += u_accent[0] * smoothstep(0.32, 1.62, current) * 0.035 * mix(1.0, 0.40, soften);\n"
+"  if (u_style.x > 0.5) color = silk(color, uv, aspect, t, soften);\n"
+"  else color = water(color, uv, aspect, t, soften, footprint, spine_at(uv.x, t, aspect));\n"
+"  float uc = 0.28 + sin(uv.x * 2.6 + t * 0.16) * 0.10 + sin(uv.x * 5.4 - t * 0.11) * 0.040;\n"
+"  float ud = uv.y - uc;\n"
+"  float upper_veil = exp(-ud * ud * mix(32.0, 13.0, soften));\n"
+"  float upper_crest = exp(-ud * ud * mix(230.0, 55.0, soften));\n"
+"  float upper_sheen = 0.72 + 0.28 * sin(uv.x * 4.2 - t * 0.22);\n"
+"  float lc = 0.72 + sin(uv.x * 2.1 - t * 0.13 + 2.4) * 0.12 + sin(uv.x * 4.7 + t * 0.083) * 0.035;\n"
+"  float ld = uv.y - lc;\n"
+"  float lower_veil = exp(-ld * ld * mix(26.0, 11.0, soften));\n"
+"  float lower_crest = exp(-ld * ld * mix(180.0, 45.0, soften));\n"
+"  float lower_sheen = 0.74 + 0.26 * sin(uv.x * 3.7 + t * 0.18 + 1.7);\n"
+"  float vs = mix(1.0, 0.38, soften);\n"
+"  color += u_accent[0] * (upper_veil * 0.052 + upper_crest * 0.025) * upper_sheen * vs;\n"
+"  color += (u_accent[2] * lower_veil * 0.16 + u_accent[0] * lower_crest * 0.028) * lower_sheen * vs;\n"
+"  float edge = distance(uv, vec2(0.5));\n"
+"  color *= 1.0 - smoothstep(0.55, 1.05, edge) * 0.55;\n"
+"  return color * mix(1.0, 0.55, soften);\n"
+"}\n"
+"void main() {\n"
+"  float aspect = u_res.x / max(u_res.y, 1.0);\n"
+"  vec3 c = wallpaper(v_uv, aspect, u_time, u_blur, 1.0 / u_res);\n"
+"  frag = vec4(max(c, vec3(0.0)), 1.0);\n"
+"}\n";
+
+/* Copies the wallpaper into the scene, optionally translucent and with a
+ * rounded window cut through it (the guide shows the running app there). */
+static const char *FS_BACKDROP_COPY =
+GLSL_HEADER
+"in vec2 v_uv;\n"
+"out vec4 frag;\n"
+"uniform sampler2D u_tex;\n"
+"uniform vec2 u_res;\n"
+"uniform float u_alpha;\n"
+"uniform vec4 u_hole;\n"
+"uniform float u_hole_radius;\n"
+"float rb(vec2 p, vec2 h, float r) { r = min(r, min(h.x, h.y)); vec2 q = abs(p) - h + vec2(r); return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r; }\n"
+"void main() {\n"
+"  vec3 c = texture(u_tex, gl_FragCoord.xy / u_res).rgb;\n"
+"  float a = u_alpha;\n"
+"  if (u_hole.z > 0.0) {\n"
+"    vec2 px = vec2(gl_FragCoord.x, u_res.y - gl_FragCoord.y);\n"
+"    vec2 h = u_hole.zw * 0.5;\n"
+"    float d = rb(px - (u_hole.xy + h), h, u_hole_radius);\n"
+"    a *= smoothstep(-0.75, 0.75, d);\n"
+"  }\n"
+"  frag = vec4(c * a, a);\n"
+"}\n";
+
+/* The scene (premultiplied, linear) to the display (premultiplied, sRGB). */
+static const char *FS_PRESENT =
+GLSL_HEADER
+"in vec2 v_uv;\n"
+"out vec4 frag;\n"
+"uniform sampler2D u_tex;\n"
+"uniform vec2 u_res;\n"
+"vec3 encode(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c)); }\n"
+"void main() {\n"
+"  vec4 s = texture(u_tex, gl_FragCoord.xy / u_res);\n"
+"  vec3 straight = s.a > 0.0001 ? s.rgb / s.a : vec3(0.0);\n"
+"  frag = vec4(encode(clamp(straight, 0.0, 1.0)) * s.a, s.a);\n"
+"}\n";
+
+/* ------------------------------------------------------------------------ */
+/* Quads: panes, glyphs, glows, pictures and text                           */
+/* ------------------------------------------------------------------------ */
+
+static const char *VS_QUAD =
+GLSL_HEADER
+"uniform vec2 u_res;\n"
+"layout(location = 0) in vec2 a_corner;\n"
+"layout(location = 1) in vec4 a_rect;\n"
+"layout(location = 2) in vec4 a_uv;\n"
+"layout(location = 3) in vec4 a_color;\n"
+"layout(location = 4) in vec4 a_shape;\n"
+"layout(location = 5) in vec4 a_material;\n"
+"layout(location = 6) in vec4 a_misc;\n"
+"out vec2 v_uv; out vec4 v_color; out vec2 v_local; out vec2 v_half;\n"
+"out vec4 v_shape; out vec4 v_material; out vec4 v_misc; out vec2 v_px;\n"
+"void main() {\n"
+"  vec2 pos = a_rect.xy + a_corner * a_rect.zw;\n"
+"  gl_Position = vec4(pos.x / u_res.x * 2.0 - 1.0, 1.0 - pos.y / u_res.y * 2.0, 0.0, 1.0);\n"
+"  v_uv = mix(a_uv.xy, a_uv.zw, a_corner);\n"
+"  v_color = a_color; v_local = a_corner * a_rect.zw; v_half = a_rect.zw * 0.5;\n"
+"  v_shape = a_shape; v_material = a_material; v_misc = a_misc; v_px = pos;\n"
+"}\n";
+
+static const char *FS_QUAD =
+GLSL_HEADER
+GLSL_COMMON
+"in vec2 v_uv; in vec4 v_color; in vec2 v_local; in vec2 v_half;\n"
+"in vec4 v_shape; in vec4 v_material; in vec4 v_misc; in vec2 v_px;\n"
+"out vec4 frag;\n"
+"uniform sampler2D u_tex;\n"
+"uniform sampler2D u_backdrop;\n"
+"uniform vec4 u_hole;\n"
+"uniform float u_hole_radius;\n"
+"const float GLYPH_SDF_RANGE = 0.125;\n"
+"const float GLYPH_CELL = 128.0;\n"
+"const vec3 GLYPH_LAMP = vec3(-0.4915, -0.7078, 0.5069);\n"
+"const float GLYPH_SHADOW = 0.30;\n"
+"const float GLYPH_FLAT_TINT = 0.22;\n"
+"const float GLYPH_FLAT_ALPHA = 0.88;\n"
+"const float GLYPH_FLAT_STAIN = 0.15;\n"
+"vec2 edge_normal(vec2 p, vec2 h, float radius, float power) {\n"
+"  vec2 e = vec2(1.0, 0.0);\n"
+"  vec2 g = vec2(rounded_box(p + e.xy, h, radius, power) - rounded_box(p - e.xy, h, radius, power),\n"
+"                rounded_box(p + e.yx, h, radius, power) - rounded_box(p - e.yx, h, radius, power));\n"
+"  float l = length(g);\n"
+"  return l < 0.0001 ? vec2(0.0, -1.0) : g / l;\n"
+"}\n"
+"float bevel_shift(float inset, float slab, float eta) {\n"
+"  float rise = bevel_rise(inset);\n"
+"  vec3 n = normalize(vec3(bevel_slope(inset), 0.0, 1.0));\n"
+"  vec3 inside = refract(vec3(0.0, 0.0, -1.0), n, eta);\n"
+"  float shift = inside.x * (slab * rise / max(-inside.z, 0.05));\n"
+"  float sin_in = abs(inside.x);\n"
+"  if (sin_in > 1e-5) {\n"
+"    float sin_out = min(sin_in / eta, 0.90);\n"
+"    float cos_out = sqrt(max(1.0 - sin_out * sin_out, 1e-4));\n"
+"    shift += sign(inside.x) * (sin_out / cos_out) * slab * GLASS_FLOAT;\n"
+"  }\n"
+"  return shift;\n"
+"}\n"
+"vec3 behind_at(vec2 px, float lod) {\n"
+"  vec2 uv = clamp(px / u_res, vec2(0.0), vec2(1.0));\n"
+"  return textureLod(u_backdrop, vec2(uv.x, 1.0 - uv.y), lod).rgb;\n"
+"}\n"
+"vec3 environment(vec3 mirrored, float key_strength) {\n"
+"  float sky = clamp(-mirrored.y, 0.0, 1.0);\n"
+"  vec3 ambient = mix(vec3(0.03, 0.03, 0.05), vec3(1.20, 1.16, 1.45), sky * sky);\n"
+"  float key = pow(max(dot(mirrored, normalize(KEY_LIGHT)), 0.0), 36.0);\n"
+"  return ambient + vec3(1.0, 0.98, 0.93) * key * 26.0 * key_strength;\n"
+"}\n"
+"float glyph_distance(vec2 uv) { return (textureLod(u_tex, uv, 0.0).r - 0.5) * 2.0 * GLYPH_SDF_RANGE; }\n"
+"float glyph_at(vec2 uv, vec4 cell) { return glyph_distance(clamp(uv, cell.xy, cell.zw)); }\n"
+"vec4 glyph_material() {\n"
+"  vec2 size = v_half * 2.0;\n"
+"  vec2 texel = 1.0 / vec2(textureSize(u_tex, 0));\n"
+"  vec2 per_pixel = GLYPH_CELL * texel / max(size, vec2(1.0));\n"
+"  vec4 cell = vec4(texel * 0.5, vec2(1.0) - texel * 0.5);\n"
+"  float d = glyph_at(v_uv, cell) * size.x;\n"
+"  float coverage = 1.0 - smoothstep(-0.75, 0.75, d);\n"
+"  float plain = v_misc.z >= 0.0 ? v_misc.z : u_style.y;\n"
+"  if (plain > 0.5) {\n"
+"    vec3 stain = mix(vec3(1.0), v_color.rgb, GLYPH_FLAT_STAIN);\n"
+"    vec3 flat_c = mix(stain, u_accent[1], GLYPH_FLAT_TINT);\n"
+"    return vec4(flat_c, coverage * GLYPH_FLAT_ALPHA * v_material.w);\n"
+"  }\n"
+"  vec2 arm = texel * 1.5;\n"
+"  float east = glyph_at(v_uv + vec2(arm.x, 0.0), cell);\n"
+"  float west = glyph_at(v_uv - vec2(arm.x, 0.0), cell);\n"
+"  float south = glyph_at(v_uv + vec2(0.0, arm.y), cell);\n"
+"  float north = glyph_at(v_uv - vec2(0.0, arm.y), cell);\n"
+"  vec2 gradient = vec2(east - west, south - north);\n"
+"  vec2 outward = normalize(gradient + vec2(1e-6, 0.0));\n"
+"  float slope = clamp(length(gradient) / (2.0 * 1.5 / GLYPH_CELL), 0.0, 1.0);\n"
+"  float ridge = smoothstep(0.20, 0.80, slope);\n"
+"  float slab = max(v_material.x, 0.5);\n"
+"  float inset = clamp(-d / slab, 0.0, 1.0);\n"
+"  vec3 surface = normalize(vec3(outward * bevel_slope(inset) * ridge, 1.0));\n"
+"  float foot = clamp(v_local.y / max(size.y, 1.0), 0.0, 1.0);\n"
+"  vec3 glass = v_color.rgb * mix(0.50, 1.0, foot * foot);\n"
+"  float alpha = mix(0.52, 0.94, foot * foot);\n"
+"  float facing = clamp(dot(surface, GLYPH_LAMP), 0.0, 1.0);\n"
+"  glass *= mix(0.70, 1.26, facing);\n"
+"  float edge = (1.0 - inset) * (1.0 - inset) * ridge;\n"
+"  float split = GLASS_DISPERSION * edge * outward.x;\n"
+"  glass *= vec3(1.0 + split, 1.0, 1.0 - split);\n"
+"  float gloss = v_material.z;\n"
+"  if (gloss > 0.0) {\n"
+"    float fresnel = 0.04 + 0.96 * pow(1.0 - clamp(surface.z, 0.0, 1.0), 5.0);\n"
+"    float lit = fresnel * gloss;\n"
+"    vec3 mirrored = reflect(vec3(0.0, 0.0, -1.0), surface);\n"
+"    float value = mix(0.42, 1.15, 0.5 + 0.5 * dot(mirrored, -GLYPH_LAMP));\n"
+"    glass = mix(glass, v_color.rgb * value, lit);\n"
+"    vec3 half_way = normalize(GLYPH_LAMP + vec3(0.0, 0.0, 1.0));\n"
+"    float spec = pow(clamp(dot(surface, half_way), 0.0, 1.0), 42.0);\n"
+"    glass += v_color.rgb * spec * gloss * 0.9;\n"
+"    alpha = max(alpha, max(lit, spec));\n"
+"  }\n"
+"  vec2 toward_lamp = normalize(GLYPH_LAMP.xy) * slab * 0.22;\n"
+"  float occluder = glyph_at(v_uv + toward_lamp * per_pixel, cell) * size.x;\n"
+"  float blocked = 1.0 - smoothstep(-slab * 0.1, slab * 0.4, occluder);\n"
+"  float shade = blocked * GLYPH_SHADOW * (1.0 - coverage);\n"
+"  float mark = alpha * coverage;\n"
+"  float total = mark + shade * (1.0 - mark);\n"
+"  vec3 rgb = max(glass, vec3(0.0)) * mark / max(total, 1e-4);\n"
+"  return vec4(rgb, total * v_material.w);\n"
+"}\n"
+"vec4 shade() {\n"
+"  float kind = v_misc.w;\n"
+"  if (kind > 0.5 && kind < 1.5) return glyph_material();\n"
+"  if (kind > 1.5 && kind < 2.5) {\n"
+"    vec2 q = (v_local - v_half) / max(v_half, vec2(1.0));\n"
+"    float r = length(q);\n"
+"    float a = exp(-5.5 * r * r) * clamp((1.0 - r) / 0.12, 0.0, 1.0);\n"
+"    return vec4(v_color.rgb, v_color.a * a * v_material.w);\n"
+"  }\n"
+"  vec4 color = texture(u_tex, v_uv) * v_color;\n"
+"  float radius = v_shape.x;\n"
+"  if (radius > 0.0) {\n"
+"    vec2 point = v_local - v_half;\n"
+"    float power = v_misc.x;\n"
+"    float d = rounded_box(point, v_half, radius, power);\n"
+"    float coverage = 1.0 - smoothstep(-0.75, 0.75, d);\n"
+"    float thickness = v_material.x;\n"
+"    float gloss = v_material.z;\n"
+"    float frost = v_shape.w;\n"
+"    if (v_shape.y <= 0.0 && (thickness > 0.0 || gloss > 0.0)) {\n"
+"      float slab = min(thickness, min(v_half.x, v_half.y) * 0.44);\n"
+"      float inset = slab > 0.0 ? clamp(-d / slab, 0.0, 1.0) : 1.0;\n"
+"      float rise = bevel_rise(inset);\n"
+"      vec2 outward = edge_normal(point, v_half, radius, power);\n"
+"      vec2 face_position = point / max(v_half, vec2(1.0));\n"
+"      vec2 face_slope = face_position * vec2(0.28, 0.45) * v_misc.y * rise;\n"
+"      vec3 surface = normalize(vec3(outward * bevel_slope(inset) + face_slope, 1.0));\n"
+"      vec3 glass = color.rgb;\n"
+"      float alpha = color.a;\n"
+"      if (slab > 0.0) {\n"
+"        float lod = frost * BACKDROP_LEVELS * (0.3 + 0.7 * inset);\n"
+"        float eta = 1.0 / GLASS_IOR;\n"
+"        float spread = GLASS_DISPERSION * eta;\n"
+"        float shift = bevel_shift(inset, slab, eta);\n"
+"        vec3 red = behind_at(v_px + outward * bevel_shift(inset, slab, eta + spread), lod);\n"
+"        vec3 green = behind_at(v_px + outward * shift, lod);\n"
+"        vec3 blue = behind_at(v_px + outward * bevel_shift(inset, slab, eta - spread), lod);\n"
+"        float stp = 0.02;\n"
+"        float sample_moves = (bevel_shift(inset + stp, slab, eta) - shift) / (stp * slab);\n"
+"        float caustic = clamp(1.0 / max(abs(1.0 - sample_moves), 0.3), 0.45, 2.6);\n"
+"        float stain = color.a * mix(0.4, 1.0, rise);\n"
+"        glass = mix(vec3(red.r, green.g, blue.b) * caustic, color.rgb, stain);\n"
+"        glass += FROST_SCATTER * frost;\n"
+"        alpha = 1.0;\n"
+"      }\n"
+"      if (gloss > 0.0) {\n"
+"        float fresnel = 0.04 + 0.96 * pow(1.0 - clamp(surface.z, 0.0, 1.0), 5.0);\n"
+"        float lit = fresnel * gloss;\n"
+"        float broad_face = smoothstep(0.68, 1.0, inset) * clamp(v_misc.y, 0.0, 1.0);\n"
+"        float key_strength = mix(1.0, 0.10, broad_face);\n"
+"        glass = mix(glass, environment(reflect(vec3(0.0, 0.0, -1.0), surface), key_strength), lit);\n"
+"        alpha = max(alpha, lit);\n"
+"      }\n"
+"      color = vec4(max(glass, vec3(0.0)), alpha);\n"
+"    }\n"
+"    float border = v_shape.y;\n"
+"    if (border > 0.0) coverage *= smoothstep(-0.75, 0.75, d + border);\n"
+"    color.a *= coverage;\n"
+"  }\n"
+"  color.a *= v_material.w;\n"
+"  return color;\n"
+"}\n"
+/* Nothing is drawn inside the card the running application shows through. */
+"void main() {\n"
+"  vec4 c = shade();\n"
+"  if (u_hole.z > 0.0) {\n"
+"    vec2 h = u_hole.zw * 0.5;\n"
+"    c.a *= smoothstep(-0.75, 0.75, rounded_box(v_px - (u_hole.xy + h), h, u_hole_radius, 2.0));\n"
+"  }\n"
+"  frag = c;\n"
+"}\n";
+
+#endif

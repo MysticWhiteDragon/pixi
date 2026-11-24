@@ -1,0 +1,32 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Raspberry Pi OS Trixie (arm64)
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libwlroots-0.18-dev libwayland-dev wayland-protocols \
+            libxkbcommon-dev libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libsdl2-mixer-dev libgles-dev
+      - name: Build
+        run: make CFLAGS="-O2 -g -Werror"
+      - name: Smoke test
+        run: |
+          compositor/pixi --version
+          shell/pixi-shell --version
+      - name: Stage install
+        run: make install DESTDIR="$PWD/stage" && find stage -maxdepth 4 | head -40
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pixi-trixie-arm64
+          path: stage/

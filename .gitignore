@@ -1,0 +1,5 @@
+compositor/pixi
+compositor/*-protocol.[ch]
+shell/pixi-shell
+shell/*-protocol.[ch]
+*.o

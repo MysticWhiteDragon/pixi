@@ -1,0 +1,23 @@
+#!/bin/sh
+# Start a Pixi session: the pixi compositor, which starts pixi-shell.
+# Run from a text console (install.sh sets tty1 up to do this at boot),
+# or pick "Pixi" on a display manager's session list.
+
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/pixi/pixi.conf"
+
+# [display] rotate = 0 | 90 | 180 | 270, for a screen mounted sideways.
+if [ -z "${PIXI_ROTATE:-}" ] && [ -f "$conf" ]; then
+    PIXI_ROTATE=$(sed -n 's/^[[:space:]]*rotate[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$conf" | head -n 1)
+    export PIXI_ROTATE
+fi
+
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=Pixi
+export XDG_SESSION_DESKTOP=pixi
+
+# A console login under systemd already has a session bus; start one otherwise.
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ ! -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ] \
+    && command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session -- pixi "$@"
+fi
+exec pixi "$@"

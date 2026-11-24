@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Pixi
+Comment=Pi Cross Interface: a console-style session for handhelds
+Exec=pixi-session
+Type=Application
+DesktopNames=Pixi

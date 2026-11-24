@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="pixi_shell_v1">
+  <copyright>
+    Copyright (C) 2026 Pixi contributors.
+    SPDX-License-Identifier: GPL-3.0-only
+  </copyright>
+
+  <description summary="private protocol between the Pixi compositor and its shell">
+    The Pixi session is two programs: the compositor (pixi) and the shell
+    (pixi-shell) it starts. This interface is how the shell learns which
+    application windows exist and tells the compositor what to show.
+
+    It is privileged. The compositor advertises the global only to the shell
+    process it started itself, identified by the pid the kernel reports for
+    the connection, never by anything the client says about itself.
+  </description>
+
+  <interface name="pixi_shell_v1" version="1">
+    <description summary="control of the session's windows">
+      The shell's own window is an ordinary xdg_toplevel. The compositor keeps
+      it the size of the display and decides, from the mode below, whether it
+      is drawn in front of the applications, over them, or not at all.
+    </description>
+
+    <enum name="mode">
+      <entry name="home" value="0" summary="only the shell is shown; applications are hidden"/>
+      <entry name="overlay" value="1" summary="the shell is drawn over the front application and has keyboard focus"/>
+      <entry name="app" value="2" summary="the front application is shown and focused; the shell is hidden"/>
+    </enum>
+
+    <request name="set_mode">
+      <description summary="choose what the display shows">
+        Asking for app mode while no application window exists is answered
+        with home mode. The compositor always confirms with a mode event.
+      </description>
+      <arg name="mode" type="uint" enum="mode"/>
+    </request>
+
+    <request name="activate">
+      <description summary="bring one application window to the front and show it"/>
+      <arg name="id" type="uint"/>
+    </request>
+
+    <request name="close">
+      <description summary="politely ask one application window to close"/>
+      <arg name="id" type="uint"/>
+    </request>
+
+    <request name="kill">
+      <description summary="end the process behind one application window"/>
+      <arg name="id" type="uint"/>
+    </request>
+
+    <request name="quit">
+      <description summary="end the session"/>
+    </request>
+
+    <event name="window">
+      <description summary="an application window appeared or changed">
+        Sent when a window is first shown and again whenever its title or
+        application id changes. The id is stable for the window's lifetime
+        and never reused within a session.
+      </description>
+      <arg name="id" type="uint"/>
+      <arg name="app_id" type="string"/>
+      <arg name="title" type="string"/>
+      <arg name="pid" type="int"/>
+    </event>
+
+    <event name="window_closed">
+      <description summary="an application window went away"/>
+      <arg name="id" type="uint"/>
+    </event>
+
+    <event name="front">
+      <description summary="which application window is in front">
+        Zero when there is no application window at all.
+      </description>
+      <arg name="id" type="uint"/>
+    </event>
+
+    <event name="mode">
+      <description summary="the mode now in force"/>
+      <arg name="mode" type="uint" enum="mode"/>
+    </event>
+
+    <event name="guide">
+      <description summary="the compositor's guide key binding was pressed">
+        The Super key, Home or F1 on a keyboard. Controllers are read by the
+        shell itself, which asks for overlay mode when their guide button is
+        pressed.
+      </description>
+    </event>
+  </interface>
+</protocol>
