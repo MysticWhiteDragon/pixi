@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write # the release job publishes a release
+
 jobs:
   build:
     name: Raspberry Pi OS Trixie (arm64)
@@ -19,14 +22,45 @@ jobs:
             build-essential pkg-config libwlroots-0.18-dev libwayland-dev wayland-protocols \
             libxkbcommon-dev libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libsdl2-mixer-dev libgles-dev libvlc-dev libqrencode-dev
       - name: Build
+        # The version is the build date, in UTC (YYYY.MM.DD), set by the Makefiles.
         run: make CFLAGS="-O2 -g -Werror"
       - name: Smoke test
         run: |
           compositor/pixi --version
           shell/pixi-shell --version
       - name: Stage install
-        run: make install DESTDIR="$PWD/stage" && find stage -maxdepth 4 | head -40
+        run: |
+          make install PREFIX=/usr/local DESTDIR="$PWD/stage"
+          find stage -maxdepth 4 | head -40
+      - name: Package
+        run: |
+          VERSION=$(date -u +%Y.%m.%d)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          tar -C stage -czf "pixi-$VERSION-trixie-arm64.tar.gz" .
       - uses: actions/upload-artifact@v4
         with:
           name: pixi-trixie-arm64
-          path: stage/
+          path: pixi-*.tar.gz
+
+  release:
+    name: Daily release
+    needs: build
+    # One release a day: only the main branch, and only when pushed or started by hand.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pixi-trixie-arm64
+      - name: Publish (replacing today's release if there already is one)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="v$(date -u +%Y.%m.%d)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" pixi-*.tar.gz --clobber
+          else
+            gh release create "$TAG" pixi-*.tar.gz --target "$GITHUB_SHA" \
+              --title "Pixi ${TAG#v}" --notes "Build of $(date -u +%Y-%m-%d) (UTC) for Raspberry Pi OS Trixie, arm64."
+          fi
