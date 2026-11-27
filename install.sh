@@ -10,9 +10,9 @@
 # What it does:
 #   1. Installs what Lite leaves out: wlroots, Mesa (KMS/GLES) drivers, SDL2, XWayland,
 #      Japanese fonts, NetworkManager, PipeWire audio, RetroArch with emulator cores,
-#      Steam Link and the foot terminal.
+#      Steam Link (the terminal is built into Pixi).
 #   2. Builds Pixi here on the Pi and installs it under /usr/local.
-#   3. Puts a starter config in ~/.config/pixi/pixi.conf and creates ~/roms/<system>.
+#   3. Puts a starter config in ~/.config/pixi/pixi.conf and creates ~/Games/roms/<system> and ~/Games/pc.
 #   4. Gives the user access to the screen, GPU, controls, audio, network and backlight.
 #   5. Unless --no-autostart: logs that user in on tty1 and starts Pixi there.
 #      Logging out of Pixi (Guide -> power -> Log out) leaves you at a shell; type
@@ -75,7 +75,7 @@ say "Installing build tools and libraries"
 apt-get install -y --no-install-recommends \
     build-essential pkg-config \
     libwlroots-0.18-dev libwayland-dev wayland-protocols libxkbcommon-dev \
-    libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libsdl2-mixer-dev libgles-dev
+    libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libsdl2-mixer-dev libgles-dev libqrencode-dev
 
 say "Installing graphics, fonts, audio, networking and session services"
 apt-get install -y --no-install-recommends \
@@ -83,11 +83,26 @@ apt-get install -y --no-install-recommends \
     xwayland fonts-noto-cjk hicolor-icon-theme \
     dbus dbus-user-session \
     network-manager \
-    pipewire pipewire-pulse pipewire-alsa wireplumber alsa-utils \
-    foot
+    pipewire pipewire-pulse pipewire-alsa wireplumber alsa-utils libqrencode4
 
 say "Installing RetroArch"
 apt-get install -y retroarch
+
+echo "Installing the web server (nginx with PHP)..."
+if apt-get install -y nginx php-fpm php-cli php-sqlite3 php-curl php-mbstring php-xml; then
+    # Pixi runs its own copy as you from Settings > Servers > Web Server; the system ones would only use memory.
+    for unit in nginx $(systemctl list-unit-files --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}'); do
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    done
+else
+    echo "  The web server could not be installed. Pixi will offer to install it later."
+fi
+
+# The web server runs as you, and port 80 is below 1024. This lets normal users listen on ports from 80 up.
+cat > /etc/sysctl.d/99-pixi-web-port.conf <<'SYSCTL'
+net.ipv4.ip_unprivileged_port_start=80
+SYSCTL
+sysctl -w net.ipv4.ip_unprivileged_port_start=80 >/dev/null 2>&1 || true
 
 say "Installing emulator cores (any this release doesn't package are skipped)"
 for core in libretro-nestopia libretro-snes9x libretro-gambatte libretro-mgba \
@@ -117,7 +132,7 @@ rm -rf "$build_dir"
 echo "  installed $(/usr/local/bin/pixi --version) and $(/usr/local/bin/pixi-shell --version)"
 
 # ---------------------------------------------------------------- user config + rom folders
-say "Creating ~/.config/pixi and ~/roms"
+say "Creating ~/.config/pixi and ~/Games"
 as_user() { runuser -u "$target_user" -- "$@"; }
 as_user mkdir -p "$target_home/.config/pixi"
 if [ ! -f "$target_home/.config/pixi/pixi.conf" ]; then
@@ -126,9 +141,15 @@ if [ ! -f "$target_home/.config/pixi/pixi.conf" ]; then
 else
     echo "  kept your existing ~/.config/pixi/pixi.conf"
 fi
+# Console games go in ~/Games/roms/<system>, PC games in ~/Games/pc/<game>. Games in an older
+# layout (~/roms, or ~/Games/<system>) are moved there by Pixi itself the next time it starts.
+sed -i -E 's|^([[:space:]]*rom_root[[:space:]]*=[[:space:]]*)~/(roms\|Games)/?[[:space:]]*$|\1~/Games/roms|' \
+    "$target_home/.config/pixi/pixi.conf"
 for sys in nes snes gb gbc gba md sms gg pce psx psp nds n64; do
-    as_user mkdir -p "$target_home/roms/$sys"
+    as_user mkdir -p "$target_home/Games/roms/$sys"
 done
+as_user mkdir -p "$target_home/Games/pc"
+as_user mkdir -p "$target_home/www"
 
 # ---------------------------------------------------------------- permissions
 say "Giving $target_user access to the screen, GPU, controls, audio and network"
@@ -192,7 +213,8 @@ fi
 cat <<'EOF'
 
   * Guide: Select + Start together (or a controller's Guide button, or Super/Home on a keyboard).
-  * Games: copy game files into ~/roms/<system> (nes, snes, gba, md, psx ...).
+  * Games: console games into ~/Games/roms/<system>, PC games into
+    ~/Games/pc/<game>/ with the game's program inside (also over FTP).
   * Steam Link: keep your PC on with Steam open, start Steam Link from Games,
     and type the PIN it shows into Steam on the PC.
 EOF

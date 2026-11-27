@@ -1,0 +1,232 @@
+#!/bin/sh
+# pixi-videoout: turns the PSPi's USB port into a webcam that shows the screen (UVC), or off again.
+#
+# Runs as root (Pixi calls it through sudo). It sets up the USB gadget in configfs and starts
+# pixi-uvc, which answers the PC and feeds it the picture.
+#
+#   pixi-videoout start [XDG_RUNTIME_DIR [WAYLAND_DISPLAY]]
+#   pixi-videoout stop
+#   pixi-videoout status
+#
+# The last line printed is a short sentence for the user. Exit status: 0 done, 3 USB device mode isn't
+# switched on yet (it is after one restart), anything else is a failure.
+
+G=/sys/kernel/config/usb_gadget/pixi
+PIDF=/run/pixi-uvc.pid
+LOG=/run/pixi-uvc.log
+UVC=/usr/local/bin/pixi-uvc
+W=800
+H=480
+NAME=w${W}x${H}
+
+say() { echo "$*"; }
+
+CONFIG_TXT=/boot/firmware/config.txt
+
+# The USB port is either a host (keyboards, drives) or a device (a webcam for a PC), set in config.txt and
+# applied at the next restart. Returns 0 if config.txt already said that, 1 if it was changed.
+set_port_role() {
+    [ -f "$CONFIG_TXT" ] || return 0
+    if [ "$1" = device ]; then
+        grep -Eq '^[[:space:]]*dtoverlay=dwc2,dr_mode=peripheral[[:space:]]*$' "$CONFIG_TXT" &&
+            ! grep -Eq '^[[:space:]]*dtoverlay=dwc2([^,]|$)' "$CONFIG_TXT" && return 0
+    else
+        grep -Eq '^[[:space:]]*dtoverlay=dwc2' "$CONFIG_TXT" || return 0
+    fi
+    cp -n "$CONFIG_TXT" "$CONFIG_TXT.pixi-backup" 2>/dev/null
+    sed -i -e '/^[[:space:]]*dtoverlay=dwc2/d' -e '/^# Added by the PSPi installer for Pixi (Video out/d' -e '/^# Pixi Video out/d' "$CONFIG_TXT"
+    if [ "$1" = device ]; then
+        printf '\n# Pixi Video out (USB webcam): the USB port acts as a device\n[all]\ndtoverlay=dwc2,dr_mode=peripheral\n' >> "$CONFIG_TXT"
+    fi
+    return 1
+}
+
+running() {
+    [ -r "$PIDF" ] || return 1
+    p=$(cat "$PIDF" 2>/dev/null)
+    [ -n "$p" ] && [ -d "/proc/$p" ] && grep -q pixi-uvc "/proc/$p/comm" 2>/dev/null
+}
+
+teardown() {
+    if [ -r "$PIDF" ]; then
+        p=$(cat "$PIDF" 2>/dev/null)
+        if [ -n "$p" ] && grep -q pixi-uvc "/proc/$p/comm" 2>/dev/null; then
+            kill "$p" 2>/dev/null
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+                [ -d "/proc/$p" ] || break
+                sleep 0.1
+            done
+            kill -9 "$p" 2>/dev/null
+        fi
+        rm -f "$PIDF"
+    fi
+    [ -d "$G" ] || return 0
+    echo "" > "$G/UDC" 2>/dev/null
+    rm -f "$G/configs/c.1/uvc.usb0" "$G/configs/c.1/uac2.usb0"
+    rmdir "$G/functions/uac2.usb0" 2>/dev/null
+    rm -f /run/pixi-audio-gadget
+    F="$G/functions/uvc.usb0"
+    rm -f "$F"/control/class/fs/h "$F"/control/class/ss/h
+    rm -f "$F"/streaming/class/fs/h "$F"/streaming/class/hs/h "$F"/streaming/class/ss/h
+    rm -f "$F"/streaming/header/h/m
+    rmdir "$F"/streaming/mjpeg/m/"$NAME" 2>/dev/null
+    rmdir "$F"/streaming/mjpeg/m 2>/dev/null
+    rmdir "$F"/streaming/header/h 2>/dev/null
+    rmdir "$F"/control/header/h 2>/dev/null
+    rmdir "$F" 2>/dev/null
+    rmdir "$G"/configs/c.1/strings/0x409 2>/dev/null
+    rmdir "$G"/configs/c.1 2>/dev/null
+    rmdir "$G"/strings/0x409 2>/dev/null
+    rmdir "$G" 2>/dev/null
+}
+
+fail() {
+    teardown
+    say "$1"
+    exit 1
+}
+
+# Builds the whole gadget from nothing and binds it to the USB controller.
+# $1 = streaming_maxpacket (bytes per microframe), $2 = 1 to add the sound device. Returns 0 if it bound.
+build_gadget() {
+    teardown
+    mkdir -p "$G" || return 1
+    cd "$G" || return 1
+    echo 0x1d6b > idVendor
+    echo 0x0104 > idProduct
+    echo 0x0100 > bcdDevice
+    echo 0x0200 > bcdUSB
+    mkdir -p strings/0x409
+    SERIAL=$(tr -d '\0' < /proc/device-tree/serial-number 2>/dev/null)
+    echo "${SERIAL:-PSPi0001}" > strings/0x409/serialnumber
+    echo "PSPi" > strings/0x409/manufacturer
+    echo "PSPi Screen" > strings/0x409/product
+    mkdir -p configs/c.1/strings/0x409
+    echo "PSPi Screen" > configs/c.1/strings/0x409/configuration
+    echo 250 > configs/c.1/MaxPower
+
+    F=functions/uvc.usb0
+    mkdir -p "$F" || return 1
+    echo "$1" > "$F/streaming_maxpacket" || return 1
+
+    # symlink targets here are looked up from the current directory, so work from inside the function
+    cd "$F" || return 1
+    mkdir -p control/header/h
+    ln -s control/header/h control/class/fs/h
+    ln -s control/header/h control/class/ss/h
+
+    mkdir -p "streaming/mjpeg/m/$NAME" || return 1
+    echo "$W" > "streaming/mjpeg/m/$NAME/wWidth"
+    echo "$H" > "streaming/mjpeg/m/$NAME/wHeight"
+    echo $((W * H * 2)) > "streaming/mjpeg/m/$NAME/dwMaxVideoFrameBufferSize"
+    echo 333333 > "streaming/mjpeg/m/$NAME/dwDefaultFrameInterval"
+    printf '333333\n666666\n1000000\n' > "streaming/mjpeg/m/$NAME/dwFrameInterval" 2>/dev/null ||
+        echo 333333 > "streaming/mjpeg/m/$NAME/dwFrameInterval"
+
+    mkdir -p streaming/header/h
+    ln -s streaming/mjpeg/m streaming/header/h/m
+    ln -s streaming/header/h streaming/class/fs/h
+    ln -s streaming/header/h streaming/class/hs/h
+    ln -s streaming/header/h streaming/class/ss/h
+
+    cd "$G" || return 1
+    ln -s "$G/functions/uvc.usb0" configs/c.1/uvc.usb0 || return 1
+
+    # Sound: a USB audio device (UAC2) so the PC can record what the PSPi plays
+    # ("p_" is the gadget playing to the host; nothing is taken from the host).
+    AUDIO=0
+    if [ "$2" = 1 ]; then
+        mkdir functions/uac2.usb0 2>/dev/null || return 1
+        echo 3 > functions/uac2.usb0/p_chmask
+        echo 48000 > functions/uac2.usb0/p_srate
+        echo 2 > functions/uac2.usb0/p_ssize
+        echo 0 > functions/uac2.usb0/c_chmask
+        echo "PSPi Audio" > functions/uac2.usb0/function_name 2>/dev/null
+        ln -s "$G/functions/uac2.usb0" configs/c.1/uac2.usb0 2>/dev/null || return 1
+        AUDIO=1
+    fi
+    { echo "$UDC" > UDC; } 2>/dev/null || return 1
+    return 0
+}
+
+start() {
+    teardown
+
+    # only accept the paths Pixi's own session uses
+    case "$1$2" in *[!A-Za-z0-9/_-]*) fail "Video out couldn't find the display session." ;; esac
+    case "$1" in /run/user/[0-9]*) ;; *) fail "Video out couldn't find the display session." ;; esac
+    case "$2" in wayland-[0-9]*) ;; *) fail "Video out couldn't find the display session." ;; esac
+
+    [ -x "$UVC" ] || fail "Video out isn't installed (pixi-uvc is missing). Run Update Pixi."
+
+    modprobe libcomposite 2>/dev/null
+    modprobe dwc2 2>/dev/null
+    mountpoint -q /sys/kernel/config 2>/dev/null || mount -t configfs none /sys/kernel/config 2>/dev/null
+    [ -d /sys/kernel/config/usb_gadget ] || fail "This system can't act as a USB device (no gadget support in the kernel)."
+
+    UDC=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+    if [ -z "$UDC" ]; then
+        set_port_role device
+        say "Restart the PSPi to switch the USB port to device mode. Video out then turns on by itself."
+        exit 3
+    fi
+
+    # Bigger USB packets mean more frames per second, if the USB controller has room for them, and the
+    # sound device may not fit either. Every attempt starts from a clean slate, biggest setup first.
+    MP=""
+    AUDIO=0
+    TRIED=""
+    # 1024 is the setup that's known to work. A bigger value can be tried by putting MAXPACKET=2048 (or 3072)
+    # in /etc/pixi-videoout.conf; if it doesn't bind, the 1024 setups follow.
+    [ -r /etc/pixi-videoout.conf ] && . /etc/pixi-videoout.conf
+    case "$MAXPACKET" in 2048|3072) ;; *) MAXPACKET=1024 ;; esac
+    case "$QUALITY" in [1-9][0-9]) ;; *) QUALITY=55 ;; esac
+    for try in "$MAXPACKET 1" "1024 1" "1024 0"; do
+        mp=${try% *}
+        want_audio=${try#* }
+        if build_gadget "$mp" "$want_audio"; then
+            MP=$mp
+            break
+        fi
+        TRIED="$TRIED $mp/$([ "$want_audio" = 1 ] && echo sound || echo no-sound)"
+        sleep 0.5   # let the USB controller settle before the next try
+    done
+    if [ -z "$MP" ]; then
+        dmesg 2>/dev/null | grep -iE "dwc2|uvc|uac|gadget|udc|configfs" | tail -n 12 > /run/pixi-videoout-dmesg.log
+        fail "The USB port wouldn't switch to device mode (tried:$TRIED)."
+    fi
+    if [ "$AUDIO" = 1 ]; then : > /run/pixi-audio-gadget; else rm -f /run/pixi-audio-gadget; fi
+
+    echo "pixi-videoout: USB packets of $MP bytes, sound $([ "$AUDIO" = 1 ] && echo on || echo off), JPEG quality $QUALITY${TRIED:+ (didn't fit:$TRIED)}" > "$LOG"
+    XDG_RUNTIME_DIR=$1 WAYLAND_DISPLAY=$2 setsid "$UVC" --size "${W}x${H}" --maxpacket "$MP" --quality "$QUALITY" >> "$LOG" 2>&1 < /dev/null &
+    echo $! > "$PIDF"
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        sleep 0.25
+        running || break
+        grep -q "ready" "$LOG" 2>/dev/null && break
+    done
+    if ! running; then
+        msg=$(tail -n 1 "$LOG" 2>/dev/null | sed 's/^pixi-uvc: //')
+        fail "Video out couldn't start${msg:+: $msg}"
+    fi
+    if [ "$AUDIO" = 1 ]; then
+        say "Video out is on. Plug the USB data port into a PC and open it as a camera (sound shows up as a PSPi microphone)."
+    else
+        say "Video out is on (without sound). Plug the USB data port into a PC and open it as a camera."
+    fi
+}
+
+case "$1" in
+    start) start "$2" "${3:-wayland-0}" ;;
+    stop)
+        teardown
+        if set_port_role host; then
+            say "Video out is off."
+        else
+            say "Video out is off. Restart the PSPi to use the USB port for keyboards and drives again."
+            exit 3
+        fi
+        ;;
+    status) if running; then say "on"; else say "off"; fi ;;
+    *) echo "usage: pixi-videoout start|stop|status" >&2; exit 2 ;;
+esac

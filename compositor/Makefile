@@ -3,7 +3,9 @@ PREFIX     ?= /usr/local
 CC         ?= cc
 PKGS        = wlroots-0.18 wayland-server xkbcommon
 CFLAGS     ?= -O2 -g
-override CFLAGS += -std=c11 -Wall -Wextra -Wno-unused-parameter -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS))
+# The version is the build date in UTC (YYYY.MM.DD); override with PIXI_VERSION=... if needed.
+PIXI_VERSION ?= $(shell date -u +%Y.%m.%d)
+override CFLAGS += -DPIXI_VERSION=\"$(PIXI_VERSION)\" -std=c11 -Wall -Wextra -Wno-unused-parameter -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS))
 override LDLIBS += $(shell pkg-config --libs $(PKGS))
 
 WAYLAND_SCANNER   := $(shell pkg-config --variable=wayland_scanner wayland-scanner)

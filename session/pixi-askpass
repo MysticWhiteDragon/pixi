@@ -1,0 +1,4 @@
+#!/bin/sh
+# sudo's password helper (SUDO_ASKPASS, and "Path askpass" in /etc/sudo.conf): Pixi shows its keyboard
+# for the password and hands it back here.
+exec /usr/local/bin/pixi-shell --askpass "$@"

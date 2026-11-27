@@ -409,13 +409,23 @@ static const System default_systems[] = {
 void cfg_defaults(void)
 {
     memset(&cfg, 0, sizeof cfg);
-    sncpy(cfg.theme, sizeof cfg.theme, "purple");
-    cfg.full_material = 1;
+    sncpy(cfg.theme, sizeof cfg.theme, "blue");
+    cfg.full_material = 0; /* the Full water-and-glass material was removed: too slow on a Pi */
     cfg.sounds = 1;
     cfg.clock24 = 1;
+    cfg.date_fmt = 0;
+    cfg.battery_pct = 1;
+    cfg.app_scheme = 0;
     cfg.category = CAT_GAMES;
+    cfg.scan_removable = 1;
+    sncpy(cfg.video_player, sizeof cfg.video_player,
+          "cvlc --fullscreen --play-and-exit --no-video-title-show");
+    sncpy(cfg.video_hwdec, sizeof cfg.video_hwdec, "no");
+    cfg.video_skip = 10;
+    cfg.video_skip_long = 60;
     sncpy(cfg.retroarch, sizeof cfg.retroarch, "retroarch");
-    sncpy(cfg.rom_root, sizeof cfg.rom_root, "~/roms");
+    sncpy(cfg.rom_root, sizeof cfg.rom_root, "~/Games/roms");
+    sncpy(cfg.pc_root, sizeof cfg.pc_root, "~/Games/pc");
     sncpy(cfg.core_dirs, sizeof cfg.core_dirs,
           "~/.config/retroarch/cores,/usr/lib/aarch64-linux-gnu/libretro,/usr/lib/arm-linux-gnueabihf/libretro,/usr/lib/libretro");
     sncpy(cfg.hide, sizeof cfg.hide,
@@ -423,12 +433,15 @@ void cfg_defaults(void)
           "org.codeberg.dnkl.footclient.desktop,display-im6.q16.desktop,debian-uxterm.desktop,debian-xterm.desktop");
     cfg.joy_ok = 0;
     cfg.joy_back = 1;
-    cfg.joy_menu = 3;
+    cfg.joy_menu = 2;
     cfg.joy_pgup = 4;
+    cfg.joy_square = 3;
     cfg.joy_pgdn = 5;
-    cfg.joy_select = 6;
-    cfg.joy_start = 7;
-    cfg.joy_guide = 8;
+    cfg.joy_select = 8;
+    cfg.joy_start = 9;
+    cfg.joy_guide = 10;
+    cfg.ftp_port = 2121;
+    cfg.web_port = 80;
     nsystems = (int)(sizeof default_systems / sizeof default_systems[0]);
     systems = xmalloc(sizeof default_systems);
     memcpy(systems, default_systems, sizeof default_systems);
@@ -469,11 +482,15 @@ static void cfg_set(const char *section, const char *key, const char *val)
     if (!*section || !strcasecmp(section, "general")) {
         if (!strcasecmp(key, "theme")) sncpy(cfg.theme, sizeof cfg.theme, val);
         else if (!strcasecmp(key, "material")) {
-            if (strcasecmp(val, "auto")) cfg.full_material = !strcasecmp(val, "full"), cfg.material_explicit = 1;
+            /* accepted and ignored, so old config files still load */
         }
         else if (!strcasecmp(key, "sounds")) cfg.sounds = parse_bool(val);
         else if (!strcasecmp(key, "confirm_button")) cfg.confirm_east = !strcasecmp(val, "east");
         else if (!strcasecmp(key, "clock_24h")) cfg.clock24 = parse_bool(val);
+        else if (!strcasecmp(key, "date_format")) {
+            cfg.date_fmt = !strcasecmp(val, "dmy") ? 1 : !strcasecmp(val, "iso") ? 2 : !strcasecmp(val, "long") ? 3 : 0;
+        }
+        else if (!strcasecmp(key, "battery_percent")) cfg.battery_pct = parse_bool(val);
         else if (!strcasecmp(key, "ui_scale")) cfg.ui_scale = strtof(val, NULL);
         else if (!strcasecmp(key, "show_terminal_apps")) cfg.show_terminal_apps = parse_bool(val);
         else if (!strcasecmp(key, "hide")) sncpy(cfg.hide, sizeof cfg.hide, val);
@@ -481,7 +498,17 @@ static void cfg_set(const char *section, const char *key, const char *val)
     } else if (!strcasecmp(section, "retroarch")) {
         if (!strcasecmp(key, "binary")) sncpy(cfg.retroarch, sizeof cfg.retroarch, val);
         else if (!strcasecmp(key, "rom_root")) sncpy(cfg.rom_root, sizeof cfg.rom_root, val);
+        else if (!strcasecmp(key, "pc_root")) sncpy(cfg.pc_root, sizeof cfg.pc_root, val);
         else if (!strcasecmp(key, "core_dirs")) sncpy(cfg.core_dirs, sizeof cfg.core_dirs, val);
+    } else if (!strcasecmp(section, "media")) {
+        if (!strcasecmp(key, "pictures")) sncpy(cfg.pictures, sizeof cfg.pictures, val);
+        else if (!strcasecmp(key, "music")) sncpy(cfg.music, sizeof cfg.music, val);
+        else if (!strcasecmp(key, "videos")) sncpy(cfg.videos, sizeof cfg.videos, val);
+        else if (!strcasecmp(key, "scan_removable")) cfg.scan_removable = parse_bool(val);
+        else if (!strcasecmp(key, "video_player")) sncpy(cfg.video_player, sizeof cfg.video_player, val);
+        else if (!strcasecmp(key, "video_hwdec")) sncpy(cfg.video_hwdec, sizeof cfg.video_hwdec, val);
+        else if (!strcasecmp(key, "video_skip")) cfg.video_skip = atoi(val) > 0 ? atoi(val) : 10;
+        else if (!strcasecmp(key, "video_skip_long")) cfg.video_skip_long = atoi(val) > 0 ? atoi(val) : 60;
     } else if (!strcasecmp(section, "input")) {
         int v = atoi(val);
         if (!strcasecmp(key, "joy_ok")) cfg.joy_ok = v;
@@ -492,7 +519,11 @@ static void cfg_set(const char *section, const char *key, const char *val)
         else if (!strcasecmp(key, "joy_select")) cfg.joy_select = v;
         else if (!strcasecmp(key, "joy_start")) cfg.joy_start = v;
         else if (!strcasecmp(key, "joy_guide")) cfg.joy_guide = v;
+        else if (!strcasecmp(key, "joy_square")) cfg.joy_square = v;
+        else if (!strcasecmp(key, "browser")) sncpy(cfg.browser_path, sizeof cfg.browser_path, val);
         else if (!strcasecmp(key, "debug")) cfg.debug_input = parse_bool(val);
+        else if (!strcasecmp(key, "ftp_port") && v > 0 && v < 65536) cfg.ftp_port = v;
+        else if (!strcasecmp(key, "web_port") && v > 0 && v < 65536) cfg.web_port = v;
     } else if (!strncasecmp(section, "system.", 7)) {
         System *s = system_get(section + 7);
         if (!strcasecmp(key, "name")) sncpy(s->name, sizeof s->name, val);
@@ -546,11 +577,20 @@ void state_load(void)
         if (!eq) continue;
         *eq = 0;
         char *k = trim(line), *v = trim(eq + 1);
-        if (!strcmp(k, "category")) cfg.category = atoi(v);
+        if (!strcmp(k, "category")) {
+            cfg.category = atoi(v);
+            if (cfg.category < 0 || cfg.category >= CAT_COLUMNS) cfg.category = CAT_GAMES;
+        }
         else if (!strcmp(k, "sounds")) cfg.sounds = atoi(v) != 0;
         else if (!strcmp(k, "theme")) sncpy(cfg.theme, sizeof cfg.theme, v);
-        else if (!strcmp(k, "material")) cfg.full_material = atoi(v) != 0, cfg.material_explicit = 1;
+        else if (!strcmp(k, "material")) {}
         else if (!strcmp(k, "confirm_east")) cfg.confirm_east = atoi(v) != 0;
+        else if (!strcmp(k, "clock24")) cfg.clock24 = atoi(v) != 0;
+        else if (!strcmp(k, "date_fmt")) cfg.date_fmt = atoi(v) < 0 || atoi(v) > 3 ? 0 : atoi(v);
+        else if (!strcmp(k, "battery_pct")) cfg.battery_pct = atoi(v) != 0;
+        else if (!strcmp(k, "app_scheme")) cfg.app_scheme = atoi(v) == 1 ? 1 : atoi(v) == 2 ? 2 : 0;
+        else if (!strcmp(k, "video_out")) cfg.video_out = atoi(v) == 1 ? 1 : 0;
+        else if (!strcmp(k, "wallpaper")) sncpy(cfg.wallpaper, sizeof cfg.wallpaper, v);
     }
     fclose(f);
 }
@@ -565,7 +605,10 @@ void state_save(void)
     if (!f) return;
     fprintf(f, "category=%d\nsounds=%d\ntheme=%s\nconfirm_east=%d\n", cfg.category, cfg.sounds, cfg.theme,
             cfg.confirm_east);
-    if (cfg.material_explicit) fprintf(f, "material=%d\n", cfg.full_material);
+    fprintf(f, "clock24=%d\ndate_fmt=%d\nbattery_pct=%d\nvideo_out=%d\n", cfg.clock24, cfg.date_fmt, cfg.battery_pct,
+            cfg.video_out);
+    fprintf(f, "wallpaper=%s\n", cfg.wallpaper);
+    fprintf(f, "app_scheme=%d\n", cfg.app_scheme);
     fclose(f);
 }
 
@@ -573,9 +616,11 @@ void state_save(void)
 /* Desktop entries                                                          */
 /* ======================================================================== */
 
-const char *cat_names[CAT_COUNT] = { "Settings", "Games", "Internet", "Multimedia", "Graphics", "Office",
+const char *cat_names[CAT_COUNT] = { "Settings", "Apps", "Pictures", "Music", "Videos", "Games",
+                                     "Internet", "Multimedia", "Graphics", "Office",
                                      "Development", "Education", "Utilities", "System", "Other" };
-const char *cat_glyphs[CAT_COUNT] = { "category-settings", "category-games", "category-internet",
+const char *cat_glyphs[CAT_COUNT] = { "category-settings", "category-software", "category-images", "category-music",
+                                      "category-video", "category-games", "category-internet",
                                       "category-multimedia", "category-graphics", "category-office",
                                       "category-development", "category-education", "category-utilities",
                                       "category-system", "category-other" };
@@ -599,7 +644,7 @@ static int category_of(const char *cats)
 
 static int category_named(const char *n)
 {
-    for (int i = 0; i < CAT_COUNT; i++)
+    for (int i = CAT_GAMES; i < CAT_COUNT; i++)
         if (!strcasecmp(n, cat_names[i])) return i;
     return CAT_OTHER;
 }
@@ -659,7 +704,9 @@ static void scan_dir(const char *dir, StrList *seen)
         if (*name_loc) sncpy(e.name, sizeof e.name, name_loc);
         if (strcmp(type, "Application") || nodisplay || hidden || onlyshowin || !*e.exec) continue;
         if (list_has(cfg.hide, e.id)) continue;
-        if (e.terminal && (!cfg.show_terminal_apps || !in_path("foot"))) continue;
+        if (e.terminal && !cfg.show_terminal_apps) continue;
+        if (!strncmp(e.exec, "foot", 4) && (!e.exec[4] || e.exec[4] == ' ' || !strncmp(e.exec + 4, "client", 6) || !strncmp(e.exec + 4, "-server", 7)))
+            continue; /* Pixi has its own terminal now */
         if (*tryexec && !in_path(tryexec)) continue;
         char **a = exec_to_argv(e.exec);
         if (!a) continue;
@@ -789,6 +836,202 @@ static void scan_roms(const System *s, const char *dir, int depth, StrList *out,
     closedir(dp);
 }
 
+/* moves everything in src into dst (made if needed), merging folders both have; a file whose name is
+ * already taken in dst stays where it was. src is removed if that empties it. */
+static void move_into(const char *src, const char *dst)
+{
+    mkdir(dst, 0755);
+    DIR *dp = opendir(src);
+    if (!dp) return;
+    struct dirent *de;
+    while ((de = readdir(dp))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char *a = xasprintf("%s/%s", src, de->d_name), *b = xasprintf("%s/%s", dst, de->d_name);
+        struct stat sa, sb;
+        if (lstat(b, &sb) != 0) {
+            if (rename(a, b) != 0) fprintf(stderr, "pixi-shell: couldn't move %s: %s\n", a, strerror(errno));
+        } else if (lstat(a, &sa) == 0 && S_ISDIR(sa.st_mode) && S_ISDIR(sb.st_mode)) {
+            move_into(a, b); /* both have this folder: merge what's inside */
+        }
+        free(a), free(b);
+    }
+    closedir(dp);
+    rmdir(src); /* only goes if it's empty now */
+}
+
+static int is_real_dir(const char *p)
+{
+    struct stat st;
+    return lstat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* Games live in ~/Games: console games in ~/Games/roms/<system>, PC games in ~/Games/pc/<game>.
+ * Older layouts are moved in once: ~/roms (the first one), and system folders straight under
+ * ~/Games (the one before this). ~/roms is left as a link to ~/Games/roms, so RetroArch playlists
+ * and anything else that points there keep working. */
+void games_folders_ensure(void)
+{
+    char games[1100], groms[1100], roms[1100], link[1100];
+    snprintf(games, sizeof games, "%s/Games", home_dir());
+    snprintf(groms, sizeof groms, "%s/Games/roms", home_dir());
+    snprintf(roms, sizeof roms, "%s/roms", home_dir());
+    mkdir(games, 0755);
+    if (is_real_dir(roms)) {
+        if (!is_real_dir(groms) && rename(roms, groms) == 0) fprintf(stderr, "pixi-shell: moved ~/roms to ~/Games/roms\n");
+        else move_into(roms, groms);
+    }
+    mkdir(groms, 0755);
+    for (int i = 0; i < nsystems; i++) { /* system folders that sat straight under ~/Games */
+        const char *cp = systems[i].dirs;
+        char d[256];
+        while (list_next(&cp, d, sizeof d)) {
+            if (d[0] == '/' || d[0] == '~' || !strcmp(d, "roms") || !strcmp(d, "pc")) continue;
+            char *old = xasprintf("%s/%s", games, d), *now = xasprintf("%s/%s", groms, d);
+            if (is_real_dir(old)) move_into(old, now);
+            free(old), free(now);
+        }
+    }
+    struct stat st;
+    ssize_t n = readlink(roms, link, sizeof link - 1);
+    if (n >= 0) link[n] = 0;
+    if (lstat(roms, &st) != 0 || (S_ISLNK(st.st_mode) && (n < 0 || strcmp(link, "Games/roms")))) {
+        unlink(roms);
+        if (symlink("Games/roms", roms) != 0) fprintf(stderr, "pixi-shell: couldn't link ~/roms to ~/Games/roms\n");
+    }
+    /* the starter settings of older versions */
+    if (!strcmp(cfg.rom_root, "~/roms") || !strcmp(cfg.rom_root, "~/roms/") || !strcmp(cfg.rom_root, "~/Games") ||
+        !strcmp(cfg.rom_root, "~/Games/"))
+        sncpy(cfg.rom_root, sizeof cfg.rom_root, "~/Games/roms");
+    char *root = expand_home(cfg.rom_root);
+    mkdir(root, 0755);
+    for (int i = 0; i < nsystems; i++) {
+        const char *cp = systems[i].dirs;
+        char d[256];
+        if (!list_next(&cp, d, sizeof d) || d[0] == '/' || d[0] == '~') continue; /* the first name is the folder */
+        char *p = xasprintf("%s/%s", root, d);
+        mkdir(p, 0755);
+        free(p);
+    }
+    free(root);
+    char *pc = expand_home(cfg.pc_root);
+    mkdir(pc, 0755);
+    free(pc);
+}
+
+/* ---- PC games ---------------------------------------------------------------------------------- */
+
+#if defined(__aarch64__)
+#define HOST_MACHINE 183 /* EM_AARCH64 */
+#elif defined(__x86_64__)
+#define HOST_MACHINE 62 /* EM_X86_64 */
+#elif defined(__arm__)
+#define HOST_MACHINE 40 /* EM_ARM */
+#elif defined(__i386__)
+#define HOST_MACHINE 3
+#else
+#define HOST_MACHINE 0
+#endif
+
+/* 2: a program for this machine, 1: a script, 0: neither (or a program for another machine) */
+static int runnable_kind(const char *path)
+{
+    unsigned char h[20] = { 0 };
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    size_t n = fread(h, 1, sizeof h, f);
+    fclose(f);
+    if (n >= 2 && h[0] == '#' && h[1] == '!') return 1;
+    size_t pl = strlen(path);
+    if (pl > 3 && !strcmp(path + pl - 3, ".sh")) return 1; /* a script without a #! line runs with sh */
+    if (n < 20 || memcmp(h, "\x7f"
+                            "ELF",
+                         4))
+        return 0;
+    unsigned type = h[5] == 1 ? (unsigned)(h[16] | h[17] << 8) : (unsigned)(h[17] | h[16] << 8);
+    unsigned mach = h[5] == 1 ? (unsigned)(h[18] | h[19] << 8) : (unsigned)(h[19] | h[18] << 8);
+    if (type != 2 && type != 3) return 0; /* executables and PIE executables only */
+    if (HOST_MACHINE && mach != HOST_MACHINE) return 0;
+    return 2;
+}
+
+static int name_has_ci(const char *hay, const char *needle)
+{
+    size_t nl = strlen(needle);
+    if (!nl) return 0;
+    for (const char *p = hay; *p; p++)
+        if (!strncasecmp(p, needle, nl)) return 1;
+    return 0;
+}
+
+/* Which file in a game's folder is the game: a launcher script (start.sh, run.sh ...) first, then a
+ * program named like the folder (Doom/doom, Quake 3/quake3), then one with the folder's name in it
+ * (Quake3/ioquake3.aarch64), then any program for this machine, then any script. Libraries and
+ * programs built for another kind of machine are passed over. Files copied over FTP lose their
+ * "executable" mark, so the contents decide, not the mark. */
+int pc_game_find(const char *dir, char *exe, size_t ecap, char *icon, size_t icap)
+{
+    exe[0] = icon[0] = 0;
+    const char *folder = basename_of(dir);
+    char flat[256];
+    size_t k = 0;
+    for (const char *p = folder; *p && k + 1 < sizeof flat; p++)
+        if (*p != ' ' && *p != '_' && *p != '-') flat[k++] = *p;
+    flat[k] = 0;
+    static const char *launchers[] = { "start.sh", "run.sh", "launch.sh", "play.sh", "game.sh", "start", "run", "launch", "play", NULL };
+    static const char *icons[] = { "icon.png", "icon.svg", "cover.png", "cover.jpg", "folder.png", "folder.jpg", NULL };
+    DIR *dp = opendir(dir);
+    if (!dp) return 0;
+    int best = 0;
+    size_t best_len = 0;
+    char named_icon[1100] = "";
+    struct dirent *de;
+    while ((de = readdir(dp))) {
+        const char *nm = de->d_name;
+        if (nm[0] == '.') continue;
+        char *p = xasprintf("%s/%s", dir, nm);
+        struct stat st;
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) {
+            free(p);
+            continue;
+        }
+        size_t nl = strlen(nm);
+        for (int i = 0; icons[i]; i++)
+            if (!strcasecmp(nm, icons[i]) && !icon[0]) sncpy(icon, icap, p);
+        if (nl > 4 && (!strcasecmp(nm + nl - 4, ".png") || !strcasecmp(nm + nl - 4, ".svg")) && strlen(folder) == nl - 4 &&
+            !strncasecmp(nm, folder, nl - 4))
+            sncpy(named_icon, sizeof named_icon, p); /* Doom/Doom.png */
+        if (!strncmp(nm, "lib", 3) || strstr(nm, ".so") || (nl > 4 && !strcasecmp(nm + nl - 4, ".dll"))) {
+            free(p);
+            continue;
+        }
+        int kind = runnable_kind(p);
+        if (!kind) {
+            free(p);
+            continue;
+        }
+        char stem[256];
+        sncpy(stem, sizeof stem, nm);
+        char *dot = strrchr(stem, '.');
+        if (dot && dot != stem) *dot = 0;
+        int score = kind == 2 ? 50 : 40;
+        for (int i = 0; launchers[i]; i++)
+            if (!strcasecmp(nm, launchers[i])) score = 110;
+        if (score < 110) {
+            if (!strcasecmp(stem, folder) || !strcasecmp(stem, flat)) score = 100;
+            else if (name_has_ci(nm, flat) || name_has_ci(nm, folder)) score = 80;
+        }
+        if (score > best || (score == best && nl < best_len)) {
+            best = score;
+            best_len = nl;
+            sncpy(exe, ecap, p);
+        }
+        free(p);
+    }
+    closedir(dp);
+    if (!icon[0] && named_icon[0]) sncpy(icon, icap, named_icon);
+    return best > 0;
+}
+
 void system_roms(const System *s, StrList *out, int limit)
 {
     char *root = expand_home(cfg.rom_root);
@@ -848,6 +1091,143 @@ void rom_title(const char *path, char *title, size_t tcap, char *tags, size_t gc
 }
 
 /* ======================================================================== */
+/* Pictures, music and videos                                               */
+/* ======================================================================== */
+
+static int ext_in(const char *name, const char *list)
+{
+    const char *dot = strrchr(name, '.');
+    if (!dot || !dot[1]) return 0;
+    return list_has(list, dot + 1);
+}
+
+int media_is(int kind, const char *name)
+{
+    switch (kind) {
+    case MEDIA_PICTURES: return ext_in(name, "jpg,jpeg,png,bmp,gif,webp");
+    case MEDIA_MUSIC: return ext_in(name, "mp3,ogg,oga,opus,flac,wav");
+    case MEDIA_VIDEOS: return ext_in(name, "mp4,mkv,avi,mov,webm,m4v,mpg,mpeg,wmv,flv,ts,ogv");
+    }
+    return 0;
+}
+
+static void root_add(MediaRoot *out, int *n, int max, const char *label, const char *path)
+{
+    if (*n >= max || !is_dir(path)) return;
+    for (int i = 0; i < *n; i++)
+        if (!strcmp(out[i].path, path)) return;
+    sncpy(out[*n].label, sizeof out[*n].label, label);
+    sncpy(out[*n].path, sizeof out[*n].path, path);
+    (*n)++;
+}
+
+int media_roots(int kind, MediaRoot *out, int max)
+{
+    static const char *home_names[3][3] = { { "Pictures", "Photos", NULL }, { "Music", NULL, NULL }, { "Videos", "Movies", NULL } };
+    static const char *drive_names[3][4] = { { "Pictures", "DCIM", "Photos", NULL }, { "Music", NULL, NULL, NULL },
+                                             { "Videos", "Movies", NULL, NULL } };
+    static const char *titles[3] = { "Pictures", "Music", "Videos" };
+    if (kind < 0 || kind > 2) return 0;
+    int n = 0;
+    char path[1100];
+    for (int i = 0; home_names[kind][i]; i++) {
+        snprintf(path, sizeof path, "%s/%s", home_dir(), home_names[kind][i]);
+        root_add(out, &n, max, titles[kind], path);
+    }
+    const char *extra = kind == MEDIA_PICTURES ? cfg.pictures : kind == MEDIA_MUSIC ? cfg.music : cfg.videos;
+    const char *cursor = extra;
+    char one[512];
+    while (list_next(&cursor, one, sizeof one)) {
+        char *p = expand_home(one);
+        root_add(out, &n, max, basename_of(p), p);
+        free(p);
+    }
+    if (cfg.scan_removable) {
+        static const char *mounts[] = { "/media/*/*", "/media/*", "/run/media/*/*", "/mnt/*" };
+        for (size_t m = 0; m < sizeof mounts / sizeof *mounts; m++) {
+            glob_t g;
+            if (glob(mounts[m], 0, NULL, &g) != 0) continue;
+            for (size_t i = 0; i < g.gl_pathc; i++) {
+                for (int d = 0; drive_names[kind][d]; d++) {
+                    snprintf(path, sizeof path, "%s/%s", g.gl_pathv[i], drive_names[kind][d]);
+                    root_add(out, &n, max, basename_of(g.gl_pathv[i]), path);
+                }
+            }
+            globfree(&g);
+        }
+    }
+    return n;
+}
+
+static int str_cmp(const void *a, const void *b) { return natural_cmp(*(char *const *)a, *(char *const *)b); }
+
+void media_list(const char *dir, int kind, StrList *dirs, StrList *files)
+{
+    DIR *dp = opendir(dir);
+    if (!dp) return;
+    struct dirent *de;
+    while ((de = readdir(dp))) {
+        if (de->d_name[0] == '.') continue;
+        char path[1400];
+        snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        int dir_p = de->d_type == DT_DIR;
+        if (de->d_type == DT_UNKNOWN || de->d_type == DT_LNK) dir_p = is_dir(path);
+        if (dir_p) {
+            if (dirs) sl_add(dirs, path);
+        } else if (files && media_is(kind, de->d_name) && files->n < 20000) {
+            sl_add(files, path);
+        }
+    }
+    closedir(dp);
+    if (dirs && dirs->n > 1) qsort(dirs->v, (size_t)dirs->n, sizeof(char *), str_cmp);
+    if (files && files->n > 1) qsort(files->v, (size_t)files->n, sizeof(char *), str_cmp);
+}
+
+int mount_points(MediaRoot *out, int max)
+{
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) return 0;
+    int n = 0;
+    char line[1400];
+    while (n < max && fgets(line, sizeof line, f)) {
+        char dev[512], dir[512];
+        if (sscanf(line, "%511s %511s", dev, dir) != 2) continue;
+        /* /proc/mounts writes spaces in a path as \040 */
+        char clean[512];
+        size_t o = 0;
+        for (size_t i = 0; dir[i] && o < sizeof clean - 1; i++) {
+            if (dir[i] == '\\' && !strncmp(dir + i + 1, "040", 3)) {
+                clean[o++] = ' ';
+                i += 3;
+            } else clean[o++] = dir[i];
+        }
+        clean[o] = 0;
+        if (strncmp(clean, "/media/", 7) && strncmp(clean, "/run/media/", 11) && strncmp(clean, "/mnt/", 5)) continue;
+        root_add(out, &n, max, basename_of(clean), clean);
+    }
+    fclose(f);
+    return n;
+}
+
+int media_find_exe(const char *name)
+{
+    if (!name || !*name) return 0;
+    if (strchr(name, '/')) return access(name, X_OK) == 0;
+    const char *path = getenv("PATH");
+    if (!path) path = "/usr/local/bin:/usr/bin:/bin";
+    char buf[1200];
+    const char *p = path;
+    while (*p) {
+        size_t n = strcspn(p, ":");
+        snprintf(buf, sizeof buf, "%.*s/%s", (int)n, p, name);
+        if (access(buf, X_OK) == 0) return 1;
+        p += n + (p[n] ? 1 : 0);
+    }
+    return 0;
+}
+
+
+/* ======================================================================== */
 /* Volume, brightness                                                       */
 /* ======================================================================== */
 
@@ -882,6 +1262,32 @@ void volume_set(int pct)
     if (in_path("amixer")) {
         snprintf(v, sizeof v, "%d%%", pct);
         char *a[] = { "amixer", "-q", "sset", "Master", v, NULL };
+        run_capture(a, NULL, 0, 2000);
+    }
+}
+
+int volume_muted(void)
+{
+    char out[256];
+    if (in_path("wpctl")) {
+        char *a[] = { "wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@", NULL };
+        if (run_capture(a, out, sizeof out, 2000) == 0) return strstr(out, "[MUTED]") != NULL;
+    }
+    if (in_path("amixer")) {
+        char *a[] = { "amixer", "sget", "Master", NULL };
+        if (run_capture(a, out, sizeof out, 2000) == 0) return strstr(out, "[off]") != NULL;
+    }
+    return 0;
+}
+
+void volume_toggle_mute(void)
+{
+    if (in_path("wpctl")) {
+        char *a[] = { "wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle", NULL };
+        if (run_capture(a, NULL, 0, 2000) == 0) return;
+    }
+    if (in_path("amixer")) {
+        char *a[] = { "amixer", "-q", "sset", "Master", "toggle", NULL };
         run_capture(a, NULL, 0, 2000);
     }
 }
@@ -966,6 +1372,91 @@ void wifi_set_radio(int on)
 {
     char *a[] = { "nmcli", "radio", "wifi", on ? "on" : "off", NULL };
     run_capture(a, NULL, 0, 8000);
+}
+
+/* ======================================================================== */
+/* Video out: the USB port as a webcam showing the screen (pixi-videoout)   */
+/* ======================================================================== */
+
+#define VIDEOOUT_HELPER "/usr/local/lib/pixi/pixi-videoout"
+#define AUDIO_ROUTE "/usr/local/lib/pixi/pixi-audio-route"
+
+int videoout_running(void)
+{
+    char pid[32] = "";
+    if (read_file_str("/run/pixi-uvc.pid", pid, sizeof pid) <= 0) return 0;
+    long p = atol(trim(pid));
+    if (p <= 1) return 0;
+    char path[64], comm[64] = "";
+    snprintf(path, sizeof path, "/proc/%ld/comm", p);
+    return read_file_str(path, comm, sizeof comm) > 0 && strstr(comm, "pixi-uvc") != NULL;
+}
+
+int videoout_apply(int mode, char *msg, size_t n)
+{
+    if (msg && n) msg[0] = 0;
+    if (access(VIDEOOUT_HELPER, X_OK) != 0) {
+        if (msg) snprintf(msg, n, "Video out isn't installed yet. Run Update Pixi first.");
+        return mode ? 1 : 0;
+    }
+    const char *rt = getenv("XDG_RUNTIME_DIR"), *wd = getenv("WAYLAND_DISPLAY");
+    char *a[] = { "sudo", "-n", VIDEOOUT_HELPER, mode ? "start" : "stop", (char *)(rt ? rt : ""), (char *)(wd ? wd : "wayland-0"), NULL };
+    char out[512];
+    int rc = run_capture(a, out, sizeof out, 20000);
+    if (access(AUDIO_ROUTE, X_OK) == 0 && (rc == 0 || !mode)) {
+        /* sound for the PC: the script goes on in the background, this only starts or stops it */
+        char *r[] = { AUDIO_ROUTE, mode ? "start" : "stop", NULL };
+        char o2[128];
+        run_capture(r, o2, sizeof o2, 5000);
+    }
+    if (msg && n) {
+        /* the helper's last line is the sentence to show */
+        char *e = out + strlen(out);
+        while (e > out && (e[-1] == '\n' || e[-1] == '\r')) *--e = 0;
+        char *nl = strrchr(out, '\n');
+        snprintf(msg, n, "%s", nl ? nl + 1 : out);
+        if (rc != 0 && rc != 3 && !msg[0]) snprintf(msg, n, "Video out couldn't be changed.");
+    }
+    return rc;
+}
+
+/* ======================================================================== */
+/* Bluetooth (rfkill, and bluetoothctl for the adapter)                     */
+/* ======================================================================== */
+
+/* 1 on, 0 off (blocked), -1 if there's no Bluetooth adapter to switch */
+int bluetooth_radio(void)
+{
+    DIR *d = opendir("/sys/class/rfkill");
+    if (!d) return -1;
+    int found = 0, on = 1;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (strncmp(e->d_name, "rfkill", 6) != 0) continue;
+        char p[320], type[32] = "";
+        snprintf(p, sizeof p, "/sys/class/rfkill/%s/type", e->d_name);
+        if (read_file_str(p, type, sizeof type) <= 0 || strcmp(trim(type), "bluetooth") != 0) continue;
+        found = 1;
+        snprintf(p, sizeof p, "/sys/class/rfkill/%s/soft", e->d_name);
+        long soft = read_file_long(p, 0);
+        snprintf(p, sizeof p, "/sys/class/rfkill/%s/hard", e->d_name);
+        long hard = read_file_long(p, 0);
+        if (soft || hard) on = 0;
+    }
+    closedir(d);
+    return found ? on : -1;
+}
+
+void bluetooth_set_radio(int on)
+{
+    if (in_path("rfkill")) {
+        char *a[] = { "rfkill", on ? "unblock" : "block", "bluetooth", NULL };
+        run_capture(a, NULL, 0, 5000);
+    }
+    if (in_path("bluetoothctl")) {
+        char *a[] = { "bluetoothctl", "power", on ? "on" : "off", NULL };
+        run_capture(a, NULL, 0, 5000);
+    }
 }
 
 void wifi_current(char *ssid, size_t cap)
@@ -1059,6 +1550,147 @@ int wifi_connect(const char *ssid, const char *password, int saved, char *err, s
             char *d[] = { "nmcli", "connection", "delete", "id", (char *)ssid, NULL };
             run_capture(d, NULL, 0, 5000);
         }
+    }
+    return rc;
+}
+
+void wifi_forget(const char *ssid)
+{
+    char *a[] = { "nmcli", "connection", "delete", "id", (char *)ssid, NULL };
+    run_capture(a, NULL, 0, 10000);
+}
+
+/* a new password for a saved network */
+int wifi_set_password(const char *ssid, const char *password, char *err, size_t errcap)
+{
+    char out[512];
+    char *a[] = { "nmcli", "connection", "modify", "id", (char *)ssid, "wifi-sec.psk", (char *)password, NULL };
+    int rc = run_capture(a, out, sizeof out, 10000);
+    if (rc != 0) {
+        char *msg = trim(out);
+        char *e = strstr(msg, "Error: ");
+        sncpy(err, errcap, e ? e + 7 : (*msg ? msg : "NetworkManager reported an error."));
+    }
+    return rc;
+}
+
+/* address, gateway and DNS of a connected network, as lines of text */
+void wifi_info(const char *ssid, char *out, size_t cap)
+{
+    out[0] = 0;
+    char raw[2048];
+    char *a[] = { "nmcli", "-t", "-f", "IP4.ADDRESS,IP4.GATEWAY,IP4.DNS", "connection", "show", "id", (char *)ssid, NULL };
+    if (run_capture(a, raw, sizeof raw, 5000) != 0) return;
+    size_t o = 0;
+    for (char *save = NULL, *ln = strtok_r(raw, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+        char *colon = strchr(ln, ':');
+        if (!colon || !colon[1]) continue;
+        const char *label = !strncmp(ln, "IP4.ADDRESS", 11) ? "IP address" : !strncmp(ln, "IP4.GATEWAY", 11) ? "Gateway" : !strncmp(ln, "IP4.DNS", 7) ? "DNS" : NULL;
+        if (label && o + 80 < cap) o += (size_t)snprintf(out + o, cap - o, "\n%s: %s", label, colon + 1);
+    }
+}
+
+int wifi_saved(WifiConn *out, int max)
+{
+    static char raw[16384];
+    char *a[] = { "nmcli", "-t", "-f", "NAME,TYPE,ACTIVE", "connection", "show", NULL };
+    if (run_capture(a, raw, sizeof raw, 5000) != 0) return 0;
+    int n = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(raw, "\n", &save); line && n < max; line = strtok_r(NULL, "\n", &save)) {
+        char *f[4];
+        if (nm_split(line, f, 3) < 3 || !strstr(f[1], "wireless")) continue;
+        sncpy(out[n].name, sizeof out[n].name, f[0]);
+        out[n].active = !strcmp(f[2], "yes");
+        n++;
+    }
+    /* the connected one first, then by name */
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+            if (out[j].active > out[i].active || (out[j].active == out[i].active && strcasecmp(out[j].name, out[i].name) < 0)) {
+                WifiConn t = out[i];
+                out[i] = out[j];
+                out[j] = t;
+            }
+    return n;
+}
+
+static void nm_unescape(char *s)
+{
+    char *w = s;
+    for (char *r = s; *r; r++) {
+        if (*r == '\\' && r[1]) r++;
+        *w++ = *r;
+    }
+    *w = 0;
+}
+
+void wifi_details(const char *name, WifiDetails *d)
+{
+    memset(d, 0, sizeof *d);
+    d->signal = d->channel = -1;
+    sncpy(d->name, sizeof d->name, name);
+    char raw[4096], keymgmt[64] = "";
+    char *a[] = { "nmcli", "-t", "-f", "GENERAL.STATE,802-11-wireless.ssid,802-11-wireless-security.key-mgmt,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS",
+                  "connection", "show", "id", (char *)name, NULL };
+    if (run_capture(a, raw, sizeof raw, 5000) == 0) {
+        char *save = NULL;
+        for (char *ln = strtok_r(raw, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+            char *colon = strchr(ln, ':');
+            if (!colon) continue;
+            *colon = 0;
+            char *v = colon + 1;
+            nm_unescape(v);
+            if (!strcmp(ln, "GENERAL.STATE")) d->active = !strcmp(v, "activated");
+            else if (!strcmp(ln, "802-11-wireless.ssid")) sncpy(d->ssid, sizeof d->ssid, v);
+            else if (!strcmp(ln, "802-11-wireless-security.key-mgmt")) sncpy(keymgmt, sizeof keymgmt, v);
+            else if (!strncmp(ln, "IP4.ADDRESS", 11) && !d->ip[0]) sncpy(d->ip, sizeof d->ip, v);
+            else if (!strcmp(ln, "IP4.GATEWAY")) sncpy(d->gateway, sizeof d->gateway, v);
+            else if (!strncmp(ln, "IP4.DNS", 7)) {
+                size_t o = strlen(d->dns);
+                if (o + strlen(v) + 3 < sizeof d->dns) snprintf(d->dns + o, sizeof d->dns - o, "%s%s", o ? ", " : "", v);
+            }
+        }
+    }
+    char *slash = strchr(d->ip, '/');
+    if (slash) *slash = 0; /* 192.168.1.20/24 -> 192.168.1.20 */
+    sncpy(d->security, sizeof d->security,
+          !keymgmt[0] ? "None" : !strcmp(keymgmt, "wpa-psk") ? "WPA/WPA2 Personal" : !strcmp(keymgmt, "sae") ? "WPA3 Personal"
+          : !strcmp(keymgmt, "none") ? "WEP" : !strcmp(keymgmt, "wpa-eap") ? "WPA Enterprise" : keymgmt);
+    if (!d->active) return;
+    /* the access point it's on: its address, channel, signal and what it really uses */
+    static char list[32768];
+    char *b[] = { "nmcli", "-t", "-f", "IN-USE,BSSID,CHAN,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "no", NULL };
+    if (run_capture(b, list, sizeof list, 5000) != 0) return;
+    char *save = NULL;
+    for (char *ln = strtok_r(list, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+        char *f[6];
+        if (nm_split(ln, f, 5) < 5 || !strchr(f[0], '*')) continue;
+        sncpy(d->bssid, sizeof d->bssid, f[1]);
+        d->channel = atoi(f[2]);
+        d->signal = atoi(f[3]);
+        if (*f[4] && strcmp(f[4], "--")) sncpy(d->security, sizeof d->security, f[4]);
+        break;
+    }
+}
+
+int wifi_connect_hidden(const char *ssid, const char *password, char *err, size_t errcap)
+{
+    char out[1024];
+    int rc;
+    if (password && *password) {
+        char *a[] = { "nmcli", "device", "wifi", "connect", (char *)ssid, "password", (char *)password, "hidden", "yes", NULL };
+        rc = run_capture(a, out, sizeof out, 45000);
+    } else {
+        char *a[] = { "nmcli", "device", "wifi", "connect", (char *)ssid, "hidden", "yes", NULL };
+        rc = run_capture(a, out, sizeof out, 45000);
+    }
+    if (rc != 0) {
+        char *msg = trim(out);
+        char *e = strstr(msg, "Error: ");
+        sncpy(err, errcap, e ? e + 7 : (*msg ? msg : "NetworkManager reported an error."));
+        char *d[] = { "nmcli", "connection", "delete", "id", (char *)ssid, NULL };
+        run_capture(d, NULL, 0, 5000);
     }
     return rc;
 }

@@ -32,10 +32,12 @@
 #include <wlr/backend/session.h>
 #include <wlr/render/allocator.h>
 #include <wlr/render/wlr_renderer.h>
+#include <wlr/render/wlr_texture.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_input_device.h>
+#include <wlr/interfaces/wlr_keyboard.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
@@ -58,7 +60,9 @@
 
 #include "pixi-shell-v1-protocol.h"
 
-#define PIXI_VERSION "1.0.0"
+#ifndef PIXI_VERSION /* set by the Makefile to the build date, in UTC */
+#define PIXI_VERSION "unknown"
+#endif
 
 enum pixi_mode { MODE_HOME = 0, MODE_OVERLAY = 1, MODE_APP = 2 };
 enum view_kind { VIEW_XDG, VIEW_X11 };
@@ -78,7 +82,17 @@ struct view {
 
     struct wl_listener map, unmap, commit, destroy;
     struct wl_listener set_title, set_app_id, request_fullscreen, request_maximize;
+    bool app_fs; /* the app asked for full screen */
     struct wl_listener associate, dissociate, request_configure, request_activate, set_class;
+};
+
+struct preview {
+    struct wl_list link;
+    struct server *server;
+    uint32_t id;
+    struct wlr_scene_surface *ss;
+    bool touched;
+    struct wl_listener destroy;
 };
 
 struct output {
@@ -111,7 +125,8 @@ struct server {
     struct wl_listener new_output;
 
     struct wlr_scene_rect *backdrop;
-    struct wlr_scene_tree *apps_tree, *shell_tree, *popup_tree;
+    struct wlr_scene_tree *apps_tree, *shell_tree, *preview_tree, *popup_tree;
+    struct wl_list previews;
 
     struct wlr_xdg_shell *xdg_shell;
     struct wl_listener new_xdg_toplevel, new_xdg_popup;
@@ -131,8 +146,10 @@ struct server {
     struct wlr_cursor *cursor;
     struct wlr_xcursor_manager *cursor_mgr;
     struct wl_listener cursor_motion, cursor_motion_absolute, cursor_button, cursor_axis, cursor_frame;
-    bool cursor_visible;
+    bool cursor_visible, cursor_placed;
     bool super_alone;
+    struct wlr_keyboard vkb; /* the shell's typing, and a keymap for apps when no real keyboard is plugged in */
+    uint32_t vkb_mods;
 
     struct wl_global *shell_global;
     struct wl_list shell_resources;
@@ -199,10 +216,47 @@ static bool view_is_child(struct view *v)
     return v->xsurf && v->xsurf->parent != NULL;
 }
 
+/* The window this one is a dialog of, if that window is on screen. */
+static struct view *view_parent(struct view *v)
+{
+    struct view *p;
+    if (v->is_shell || v->override_redirect) return NULL;
+    wl_list_for_each(p, &v->server->views, link) {
+        if (p == v || !p->mapped || p->is_shell || p->override_redirect) continue;
+        if (v->kind == VIEW_XDG && p->kind == VIEW_XDG && v->xdg->parent && p->xdg == v->xdg->parent) return p;
+        if (v->kind == VIEW_X11 && p->kind == VIEW_X11 && v->xsurf && v->xsurf->parent && p->xsurf == v->xsurf->parent) return p;
+    }
+    return NULL;
+}
+
+/* An app is one window and all of its dialogs; this is the window that stands for it. */
+static struct view *view_root(struct view *v)
+{
+    for (int i = 0; i < 16; i++) {
+        struct view *p = view_parent(v);
+        if (!p) break;
+        v = p;
+    }
+    return v;
+}
+
 /* Move a window's scene node; X11 windows have none until they are shown. */
 static void view_place(struct view *v, int x, int y)
 {
     if (v->tree) wlr_scene_node_set_position(&v->tree->node, x, y);
+}
+
+/* Fill the display. The shell is full screen. An app is maximized instead, so it keeps its own title, tabs and
+ * toolbars, and goes full screen only when it asks to (a video player, a game's F11). */
+static void view_set_state(struct view *v, int w, int h)
+{
+    wlr_xdg_toplevel_set_size(v->xdg, w, h);
+    if (v->is_shell) {
+        wlr_xdg_toplevel_set_fullscreen(v->xdg, true);
+    } else {
+        wlr_xdg_toplevel_set_maximized(v->xdg, true);
+        wlr_xdg_toplevel_set_fullscreen(v->xdg, v->app_fs);
+    }
 }
 
 /* Fill the display, unless this is a dialog of another window. */
@@ -213,8 +267,7 @@ static void view_fit(struct view *v)
     if (v->kind == VIEW_XDG) {
         if (!v->xdg->base->initialized) return;
         if (v->is_shell || !view_is_child(v)) {
-            wlr_xdg_toplevel_set_size(v->xdg, w, h);
-            wlr_xdg_toplevel_set_fullscreen(v->xdg, true);
+            view_set_state(v, w, h);
             view_place(v, 0, 0);
         } else {
             struct wlr_box geo;
@@ -225,8 +278,9 @@ static void view_fit(struct view *v)
         if (v->override_redirect) {
             view_place(v, v->xsurf->x, v->xsurf->y);
         } else if (!view_is_child(v)) {
+            /* Full size but not "full screen": a program told it is full screen (Chrome, for one) hides its tabs and
+             * address bar and has no way back. */
             wlr_xwayland_surface_configure(v->xsurf, 0, 0, (uint16_t)w, (uint16_t)h);
-            wlr_xwayland_surface_set_fullscreen(v->xsurf, true);
             view_place(v, 0, 0);
         } else {
             int cw = v->xsurf->width, ch = v->xsurf->height;
@@ -252,11 +306,17 @@ static void view_close(struct view *v)
     else if (v->xsurf) wlr_xwayland_surface_close(v->xsurf);
 }
 
+/* Something that is an application in its own right, as opposed to a dialog of one. */
+static bool view_is_app(struct view *v)
+{
+    return v->mapped && !v->is_shell && !v->override_redirect && v->id != 0 && view_root(v) == v;
+}
+
 static struct view *front_app(struct server *s)
 {
     struct view *v;
     wl_list_for_each(v, &s->views, link) {
-        if (v->mapped && !v->is_shell && !v->override_redirect) return v;
+        if (view_is_app(v)) return v;
     }
     return NULL;
 }
@@ -264,10 +324,21 @@ static struct view *front_app(struct server *s)
 static struct view *view_by_id(struct server *s, uint32_t id)
 {
     struct view *v;
+    if (!id) return NULL;
     wl_list_for_each(v, &s->views, link) {
         if (v->id == id) return v;
     }
     return NULL;
+}
+
+/* Whoever should have the keyboard in an app: its newest dialog, or the app itself. */
+static struct view *app_focus_view(struct server *s, struct view *app)
+{
+    struct view *found = app, *v;
+    wl_list_for_each(v, &s->views, link) {
+        if (v != app && v->mapped && !v->is_shell && !v->override_redirect && view_root(v) == app) found = v;
+    }
+    return found;
 }
 
 /* ======================================================================== */
@@ -328,15 +399,17 @@ static void apply_mode(struct server *s)
     wlr_scene_node_set_enabled(&s->shell_tree->node, shell_shown);
     wlr_scene_node_set_enabled(&s->apps_tree->node, apps_shown);
     wlr_scene_node_raise_to_top(&s->shell_tree->node);
+    wlr_scene_node_raise_to_top(&s->preview_tree->node);
     wlr_scene_node_raise_to_top(&s->popup_tree->node);
 
+    struct view *focus = app ? app_focus_view(s, app) : NULL;
     struct view *v;
     wl_list_for_each(v, &s->views, link) {
-        if (!v->is_shell && !v->override_redirect) view_set_activated(v, s->mode == MODE_APP && v == app);
+        if (!v->is_shell && !v->override_redirect) view_set_activated(v, s->mode == MODE_APP && v == focus);
     }
     if (s->shell_view) view_set_activated(s->shell_view, shell_shown);
 
-    if (s->mode == MODE_APP && app) focus_surface(s, view_surface(app));
+    if (s->mode == MODE_APP && focus) focus_surface(s, view_surface(focus));
     else if (shell_shown && s->shell_view && s->shell_view->mapped) focus_surface(s, view_surface(s->shell_view));
     else focus_surface(s, NULL);
     shell_send_state(s);
@@ -348,11 +421,18 @@ static void set_mode(struct server *s, enum pixi_mode mode)
     apply_mode(s);
 }
 
+/* Bring an app to the front, with its dialogs on top of it. */
 static void raise_view(struct server *s, struct view *v)
 {
+    v = view_root(v);
     wl_list_remove(&v->link);
     wl_list_insert(&s->views, &v->link);
     if (v->tree) wlr_scene_node_raise_to_top(&v->tree->node);
+    struct view *c;
+    wl_list_for_each(c, &s->views, link) { /* dialogs are kept in the order they opened */
+        if (c != v && c->mapped && c->tree && !c->is_shell && !c->override_redirect && view_root(c) == v)
+            wlr_scene_node_raise_to_top(&c->tree->node);
+    }
 }
 
 static void shell_handle_set_mode(struct wl_client *c, struct wl_resource *r, uint32_t mode)
@@ -388,6 +468,65 @@ static void shell_handle_kill(struct wl_client *c, struct wl_resource *r, uint32
     else view_close(v);
 }
 
+static void preview_destroyed(struct wl_listener *l, void *data)
+{
+    struct preview *p = wl_container_of(l, p, destroy);
+    wl_list_remove(&p->destroy.link);
+    wl_list_remove(&p->link);
+    free(p);
+}
+
+static void preview_remove(struct preview *p)
+{
+    /* destroying the node runs preview_destroyed, which frees p */
+    wlr_scene_node_destroy(&p->ss->buffer->node);
+}
+
+static void shell_handle_preview(struct wl_client *c, struct wl_resource *r, uint32_t id, int32_t x, int32_t y, int32_t w, int32_t h,
+                                 uint32_t opacity)
+{
+    struct server *s = wl_resource_get_user_data(r);
+    struct view *v = view_by_id(s, id);
+    if (!v || v->is_shell || !v->mapped || w < 1 || h < 1) return;
+    struct wlr_surface *surf = view_surface(v);
+    if (!surf) return;
+    struct preview *p = NULL, *it;
+    wl_list_for_each(it, &s->previews, link) {
+        if (it->id == id) {
+            p = it;
+            break;
+        }
+    }
+    if (!p) {
+        p = calloc(1, sizeof *p);
+        if (!p) return;
+        p->ss = wlr_scene_surface_create(s->preview_tree, surf);
+        if (!p->ss) {
+            free(p);
+            return;
+        }
+        p->server = s;
+        p->id = id;
+        p->destroy.notify = preview_destroyed;
+        wl_signal_add(&p->ss->buffer->node.events.destroy, &p->destroy);
+        wl_list_insert(&s->previews, &p->link);
+    }
+    p->touched = true;
+    wlr_scene_node_set_position(&p->ss->buffer->node, x, y);
+    wlr_scene_buffer_set_dest_size(p->ss->buffer, w, h);
+    wlr_scene_buffer_set_opacity(p->ss->buffer, opacity > 1000 ? 1.0f : (float)opacity / 1000.0f);
+}
+
+static void shell_handle_previews_flush(struct wl_client *c, struct wl_resource *r)
+{
+    struct server *s = wl_resource_get_user_data(r);
+    struct preview *p, *tmp;
+    wl_list_for_each_safe(p, tmp, &s->previews, link) {
+        if (!p->touched) preview_remove(p);
+        else p->touched = false;
+    }
+}
+
 static void shell_handle_quit(struct wl_client *c, struct wl_resource *r)
 {
     struct server *s = wl_resource_get_user_data(r);
@@ -395,16 +534,172 @@ static void shell_handle_quit(struct wl_client *c, struct wl_resource *r)
     wl_display_terminate(s->display);
 }
 
+/* ---------- typing and pointing for the shell's gamepad-as-mouse mode ---------- */
+
+static uint32_t now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint32_t)(t.tv_sec * 1000 + t.tv_nsec / 1000000);
+}
+
+/* these only act while an application is on screen in front */
+static bool injecting(struct server *s) { return s->mode == MODE_APP && front_app(s) != NULL; }
+
+static void show_cursor(struct server *s);
+static void process_motion(struct server *s, uint32_t time);
+
+static void shell_handle_key(struct wl_client *c, struct wl_resource *r, uint32_t keycode, uint32_t mods, uint32_t state)
+{
+    struct server *s = wl_resource_get_user_data(r);
+    struct view *app = front_app(s);
+    if (!app || (s->mode != MODE_APP && s->mode != MODE_OVERLAY)) return;
+    if (s->mode == MODE_OVERLAY) {
+        /* The shell's keyboard is up over the app. Like Squeekboard on Raspberry Pi OS, it must not keep the
+         * keyboard for itself: whatever it types goes to the app, so the app takes the keyboard focus. */
+        struct view *f = app_focus_view(s, app);
+        struct wlr_surface *surf = f ? view_surface(f) : NULL;
+        if (!surf) return;
+        if (s->seat->keyboard_state.focused_surface != surf) {
+            view_set_activated(f, true);
+            focus_surface(s, surf);
+        }
+    }
+    if (mods != s->vkb_mods) {
+        struct wlr_keyboard_modifiers m = { .depressed = mods };
+        wlr_seat_keyboard_notify_modifiers(s->seat, &m);
+        s->vkb_mods = mods;
+    }
+    wlr_seat_keyboard_notify_key(s->seat, now_ms(), keycode, state ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
+}
+
+static void place_cursor(struct server *s)
+{
+    if (s->cursor_placed) return;
+    int w, h;
+    display_size(s, &w, &h);
+    wlr_cursor_warp(s->cursor, NULL, w / 2.0, h / 2.0);
+    s->cursor_placed = true;
+}
+
+static void shell_handle_pointer_move(struct wl_client *c, struct wl_resource *r, wl_fixed_t dx, wl_fixed_t dy)
+{
+    struct server *s = wl_resource_get_user_data(r);
+    if (!injecting(s)) return;
+    place_cursor(s);
+    wlr_cursor_move(s->cursor, NULL, wl_fixed_to_double(dx), wl_fixed_to_double(dy));
+    process_motion(s, now_ms());
+    wlr_seat_pointer_notify_frame(s->seat);
+}
+
+static void shell_handle_pointer_button(struct wl_client *c, struct wl_resource *r, uint32_t button, uint32_t state)
+{
+    struct server *s = wl_resource_get_user_data(r);
+    if (!injecting(s)) return;
+    place_cursor(s);
+    process_motion(s, now_ms()); /* so the click goes to the window under the pointer */
+    wlr_seat_pointer_notify_button(s->seat, now_ms(), button, state ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
+    wlr_seat_pointer_notify_frame(s->seat);
+}
+
+static void shell_handle_pointer_scroll(struct wl_client *c, struct wl_resource *r, wl_fixed_t dx, wl_fixed_t dy)
+{
+    struct server *s = wl_resource_get_user_data(r);
+    if (!injecting(s)) return;
+    place_cursor(s);
+    process_motion(s, now_ms());
+    double d[2] = { wl_fixed_to_double(dx), wl_fixed_to_double(dy) };
+    for (int i = 0; i < 2; i++) {
+        if (d[i] == 0) continue;
+        wlr_seat_pointer_notify_axis(s->seat, now_ms(), i ? WL_POINTER_AXIS_VERTICAL_SCROLL : WL_POINTER_AXIS_HORIZONTAL_SCROLL, d[i] * 15.0,
+                                     (int32_t)(d[i] * 120.0), WL_POINTER_AXIS_SOURCE_WHEEL, WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+    }
+    wlr_seat_pointer_notify_frame(s->seat);
+}
+
+static void shell_handle_pointer_visible(struct wl_client *c, struct wl_resource *r, uint32_t visible)
+{
+    struct server *s = wl_resource_get_user_data(r);
+    if (visible) {
+        if (!injecting(s)) return;
+        place_cursor(s);
+        show_cursor(s);
+        process_motion(s, now_ms());
+        wlr_seat_pointer_notify_frame(s->seat);
+    } else if (s->cursor_visible) {
+        wlr_cursor_unset_image(s->cursor);
+        s->cursor_visible = false;
+        wlr_seat_pointer_clear_focus(s->seat);
+    }
+}
+
+/* The picture of a window, for the shell's screenshot button: read back from the surface's texture and written as a
+ * PPM, under a temporary name first so the shell never sees half a file. */
+static void shell_handle_screenshot(struct wl_client *c, struct wl_resource *r, uint32_t id, const char *path)
+{
+    struct server *s = wl_resource_get_user_data(r);
+    struct view *v = view_by_id(s, id);
+    if (!v || v->is_shell || !path || path[0] != '/' || strlen(path) > 900) return;
+    struct wlr_surface *surf = view_surface(v);
+    struct wlr_texture *tex = surf ? wlr_surface_get_texture(surf) : NULL;
+    if (!tex || tex->width == 0 || tex->height == 0 || tex->width > 8192 || tex->height > 8192) return;
+    uint32_t w = tex->width, h = tex->height;
+    uint8_t *px = malloc((size_t)w * h * 4);
+    if (!px) return;
+    /* the formats that are four bytes a pixel, with where red is: DRM fourcc codes AR24, XR24 (B G R A in memory)
+     * and AB24, XB24 (R G B A) */
+    static const struct { uint32_t fmt; int red_first; } tries[] = { { 0x34325241, 0 }, { 0x34325258, 0 }, { 0x34324241, 1 }, { 0x34324258, 1 } };
+    int ok = 0, red_first = 0;
+    for (size_t i = 0; i < sizeof tries / sizeof *tries && !ok; i++) {
+        struct wlr_texture_read_pixels_options o = { .data = px, .format = tries[i].fmt, .stride = w * 4 };
+        if (wlr_texture_read_pixels(tex, &o)) ok = 1, red_first = tries[i].red_first;
+    }
+    if (ok) {
+        char tmp[1000];
+        snprintf(tmp, sizeof tmp, "%s.part", path);
+        FILE *f = fopen(tmp, "wb");
+        if (f) {
+            fprintf(f, "P6\n%u %u\n255\n", w, h);
+            uint8_t *row = malloc((size_t)w * 3);
+            for (uint32_t y = 0; row && y < h; y++) {
+                const uint8_t *src = px + (size_t)y * w * 4;
+                for (uint32_t x = 0; x < w; x++) {
+                    row[x * 3 + 0] = src[x * 4 + (red_first ? 0 : 2)];
+                    row[x * 3 + 1] = src[x * 4 + 1];
+                    row[x * 3 + 2] = src[x * 4 + (red_first ? 2 : 0)];
+                }
+                fwrite(row, 3, w, f);
+            }
+            free(row);
+            int bad = ferror(f);
+            fclose(f);
+            if (bad || rename(tmp, path) != 0) unlink(tmp);
+        }
+    }
+    free(px);
+}
+
 static const struct pixi_shell_v1_interface shell_impl = {
     .set_mode = shell_handle_set_mode,
     .activate = shell_handle_activate,
     .close = shell_handle_close,
     .kill = shell_handle_kill,
+    .preview = shell_handle_preview,
+    .previews_flush = shell_handle_previews_flush,
     .quit = shell_handle_quit,
+    .key = shell_handle_key,
+    .pointer_move = shell_handle_pointer_move,
+    .pointer_button = shell_handle_pointer_button,
+    .pointer_scroll = shell_handle_pointer_scroll,
+    .pointer_visible = shell_handle_pointer_visible,
+    .screenshot = shell_handle_screenshot,
 };
 
 static void shell_resource_destroy(struct wl_resource *r)
 {
+    struct server *s = wl_resource_get_user_data(r);
+    struct preview *p, *tmp;
+    wl_list_for_each_safe(p, tmp, &s->previews, link) preview_remove(p);
     wl_list_remove(wl_resource_get_link(r));
 }
 
@@ -421,7 +716,7 @@ static void shell_bind(struct wl_client *client, void *data, uint32_t version, u
     /* Bring the new shell up to date. */
     struct view *v;
     wl_list_for_each_reverse(v, &s->views, link) {
-        if (v->mapped && !v->is_shell && !v->override_redirect) pixi_shell_v1_send_window(r, v->id, view_app_id(v), view_title(v), (int32_t)view_pid(v));
+        if (view_is_app(v)) pixi_shell_v1_send_window(r, v->id, view_app_id(v), view_title(v), (int32_t)view_pid(v));
     }
     struct view *f = front_app(s);
     pixi_shell_v1_send_front(r, f ? f->id : 0);
@@ -462,13 +757,27 @@ static void view_mapped(struct view *v)
         apply_mode(s);
         return;
     }
+    struct view *root = v->override_redirect ? NULL : view_root(v);
     if (!v->in_list) {
-        wl_list_insert(&s->views, &v->link);
+        /* dialogs go at the back of the list (it is front first, and only apps are ever listed to the shell) */
+        if (root && root != v) wl_list_insert(s->views.prev, &v->link);
+        else wl_list_insert(&s->views, &v->link);
         v->in_list = true;
     }
     if (v->override_redirect) {
         view_fit(v);
         wlr_scene_node_raise_to_top(&v->tree->node);
+        return;
+    }
+    if (root && root != v) {
+        /* A dialog of an app belongs to that app: not a window of its own, no entry in the switcher. */
+        view_fit(v);
+        if (root == front_app(s)) {
+            raise_view(s, root);
+        } else if (v->tree && root->tree) {
+            wlr_scene_node_place_above(&v->tree->node, &root->tree->node);
+        }
+        if (s->mode == MODE_APP) apply_mode(s);
         return;
     }
     v->id = ++s->next_id;
@@ -494,6 +803,24 @@ static void view_unmapped(struct view *v)
         v->in_list = false;
     }
     if (v->override_redirect) return;
+    if (!v->id) { /* a dialog: its app gets the keyboard back */
+        if (s->mode == MODE_APP) apply_mode(s);
+        return;
+    }
+    {
+        struct view *c;
+        wl_list_for_each(c, &s->views, link) { /* an app's dialogs don't outlive it */
+            if (c->mapped && !c->is_shell && !c->override_redirect && c->id == 0 && c->kind == v->kind &&
+                (v->kind == VIEW_XDG ? c->xdg->parent == v->xdg : c->xsurf && c->xsurf->parent == v->xsurf))
+                view_close(c);
+        }
+    }
+    {
+        struct preview *p, *tmp;
+        wl_list_for_each_safe(p, tmp, &s->previews, link) {
+            if (p->id == v->id) preview_remove(p);
+        }
+    }
     if (v->id) shell_send_closed(s, v->id);
     v->id = 0;
     /* Back to the next application, or home when there is none. */
@@ -523,8 +850,7 @@ static void xdg_commit(struct wl_listener *l, void *data)
         int w, h;
         display_size(v->server, &w, &h);
         if (v->is_shell || !view_is_child(v)) {
-            wlr_xdg_toplevel_set_size(v->xdg, w, h);
-            wlr_xdg_toplevel_set_fullscreen(v->xdg, true);
+            view_set_state(v, w, h);
         } else {
             wlr_xdg_toplevel_set_size(v->xdg, 0, 0);
         }
@@ -547,9 +873,15 @@ static void xdg_app_id(struct wl_listener *l, void *data)
 
 static void xdg_request_state(struct wl_listener *l, void *data)
 {
-    /* Everything is full screen already; just acknowledge with a configure. */
+    /* Apps fill the screen already; honor a request to go full screen (or leave it). */
     struct view *v = wl_container_of(l, v, request_fullscreen);
-    if (v->xdg->base->initialized) wlr_xdg_surface_schedule_configure(v->xdg->base);
+    if (!v->is_shell) v->app_fs = v->xdg->requested.fullscreen;
+    if (v->xdg->base->initialized) {
+        int w, h;
+        display_size(v->server, &w, &h);
+        if (!view_is_child(v) || v->is_shell) view_set_state(v, w, h);
+        wlr_xdg_surface_schedule_configure(v->xdg->base);
+    }
 }
 
 static void xdg_request_maximize(struct wl_listener *l, void *data)
@@ -712,7 +1044,7 @@ static void x11_request_activate(struct wl_listener *l, void *data)
 {
     struct view *v = wl_container_of(l, v, request_activate);
     if (v->mapped && !v->override_redirect && v->server->mode == MODE_APP) {
-        raise_view(v->server, v);
+        raise_view(v->server, v); /* brings the app forward, dialogs included */
         apply_mode(v->server);
     }
 }
@@ -933,7 +1265,9 @@ static void keyboard_destroy(struct wl_listener *l, void *data)
     wl_list_remove(&k->key.link);
     wl_list_remove(&k->destroy.link);
     wl_list_remove(&k->link);
+    struct server *s = k->server;
     free(k);
+    if (wl_list_empty(&s->keyboards)) wlr_seat_set_keyboard(s->seat, &s->vkb);
 }
 
 static void new_keyboard(struct server *s, struct wlr_input_device *dev)
@@ -973,9 +1307,8 @@ static void new_input(struct wl_listener *l, void *data)
     default:
         break;
     }
-    uint32_t caps = WL_SEAT_CAPABILITY_POINTER;
-    if (!wl_list_empty(&s->keyboards)) caps |= WL_SEAT_CAPABILITY_KEYBOARD;
-    wlr_seat_set_capabilities(s->seat, caps);
+    /* There is always a pointer and a keyboard to talk to: the shell can type and point for a gamepad. */
+    wlr_seat_set_capabilities(s->seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
 }
 
 static void show_cursor(struct server *s)
@@ -1218,6 +1551,8 @@ int main(int argc, char **argv)
     s.backdrop = wlr_scene_rect_create(&s.scene->tree, 1280, 720, black);
     s.apps_tree = wlr_scene_tree_create(&s.scene->tree);
     s.shell_tree = wlr_scene_tree_create(&s.scene->tree);
+    s.preview_tree = wlr_scene_tree_create(&s.scene->tree);
+    wl_list_init(&s.previews);
     s.popup_tree = wlr_scene_tree_create(&s.scene->tree);
 
     wl_list_init(&s.views);
@@ -1248,13 +1583,25 @@ int main(int argc, char **argv)
     s.new_input.notify = new_input;
     wl_signal_add(&s.backend->events.new_input, &s.new_input);
     s.seat = wlr_seat_create(s.display, "seat0");
+    {
+        static const struct wlr_keyboard_impl vkb_impl = { .name = "pixi-virtual" };
+        wlr_keyboard_init(&s.vkb, &vkb_impl, "pixi-virtual");
+        struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+        struct xkb_keymap *keymap = xkb_keymap_new_from_names(ctx, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
+        if (keymap) wlr_keyboard_set_keymap(&s.vkb, keymap);
+        xkb_keymap_unref(keymap);
+        xkb_context_unref(ctx);
+        wlr_keyboard_set_repeat_info(&s.vkb, 25, 600);
+        wlr_seat_set_keyboard(s.seat, &s.vkb);
+        wlr_seat_set_capabilities(s.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+    }
     s.request_cursor.notify = request_cursor;
     wl_signal_add(&s.seat->events.request_set_cursor, &s.request_cursor);
     s.request_set_selection.notify = request_set_selection;
     wl_signal_add(&s.seat->events.request_set_selection, &s.request_set_selection);
 
     wl_list_init(&s.shell_resources);
-    s.shell_global = wl_global_create(s.display, &pixi_shell_v1_interface, 1, &s, shell_bind);
+    s.shell_global = wl_global_create(s.display, &pixi_shell_v1_interface, 4, &s, shell_bind);
     wl_display_set_global_filter(s.display, global_filter, &s);
 
     s.xwayland = wlr_xwayland_create(s.display, s.compositor, true);

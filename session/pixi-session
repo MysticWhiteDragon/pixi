@@ -11,6 +11,11 @@ if [ -z "${PIXI_ROTATE:-}" ] && [ -f "$conf" ]; then
     export PIXI_ROTATE
 fi
 
+# Make sure the boot screen (Plymouth) is gone so Pixi can use the display.
+if command -v plymouth >/dev/null 2>&1; then
+    timeout 5 plymouth quit >/dev/null 2>&1 || true
+fi
+
 export XDG_SESSION_TYPE=wayland
 export XDG_CURRENT_DESKTOP=Pixi
 export XDG_SESSION_DESKTOP=pixi

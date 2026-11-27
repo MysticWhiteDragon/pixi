@@ -1,0 +1,86 @@
+#!/bin/sh
+# pixi-audio-route: sends what the PSPi plays to the USB audio device that Video out adds, so a PC
+# can record it (it shows up there as a microphone). Runs as the normal user, inside the PipeWire session.
+#
+#   pixi-audio-route start     connect the speakers' sound to the USB audio device (in the background)
+#   pixi-audio-route stop
+#
+# Log: $XDG_RUNTIME_DIR/pixi-audio.log
+
+RT=${XDG_RUNTIME_DIR:-/tmp}
+PIDF=$RT/pixi-audio.pid
+LOG=$RT/pixi-audio.log
+
+stop() {
+    if [ -r "$PIDF" ]; then
+        p=$(cat "$PIDF" 2>/dev/null)
+        [ -n "$p" ] && kill "$p" 2>/dev/null
+        rm -f "$PIDF"
+    fi
+}
+
+# prints: <name of the sink to copy> <name of the USB audio sink> <1 if the USB sink became the default>
+pick() {
+    pw-dump 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sinks, default = [], None
+for o in d:
+    t = o.get("type", "")
+    if t == "PipeWire:Interface:Node":
+        p = o.get("info", {}).get("props", {})
+        if p.get("media.class") == "Audio/Sink":
+            sinks.append(p)
+    elif t == "PipeWire:Interface:Metadata":
+        for m in o.get("metadata", []):
+            if m.get("key") == "default.audio.sink":
+                v = m.get("value")
+                default = v.get("name") if isinstance(v, dict) else None
+def is_usb(p):
+    s = json.dumps(p).lower()
+    return "uac2" in s or "gadget" in s
+usb = [p for p in sinks if is_usb(p)]
+real = sorted([p for p in sinks if not is_usb(p)], key=lambda p: -int(p.get("priority.session", 0) or 0))
+if usb and real:
+    print(real[0]["node.name"], usb[0]["node.name"], 1 if default == usb[0]["node.name"] else 0)
+'
+}
+
+case "$1" in
+    stop) stop; exit 0 ;;
+    start) ;;
+    *) echo "usage: pixi-audio-route start|stop" >&2; exit 2 ;;
+esac
+
+[ -e /run/pixi-audio-gadget ] || exit 0   # Video out has no sound this time
+command -v pw-loopback >/dev/null 2>&1 || { echo "pixi-audio-route: pw-loopback is missing (install pipewire-bin)" >> "$LOG"; exit 0; }
+command -v python3 >/dev/null 2>&1 || { echo "pixi-audio-route: python3 is missing" >> "$LOG"; exit 0; }
+
+stop
+(
+    # the sound card of the USB audio device takes a moment to appear in PipeWire
+    set --
+    i=0
+    while [ "$i" -lt 60 ]; do
+        set -- $(pick)
+        [ -n "$2" ] && break
+        i=$((i + 1))
+        sleep 1
+    done
+    if [ -z "$2" ]; then
+        echo "pixi-audio-route: the USB audio device never showed up in PipeWire" >&2
+        exit 1
+    fi
+    echo "pixi-audio-route: copying '$1' to '$2'" >&2
+    # a new sound card can become the default; keep the PSPi's own speakers as the default
+    if [ "$3" = 1 ] && command -v pw-metadata >/dev/null 2>&1; then
+        pw-metadata -n default 0 default.configured.audio.sink "{ \"name\": \"$1\" }" Spa:String:JSON >/dev/null 2>&1
+    fi
+    exec pw-loopback -n pixi-videoout-audio -C "$1" -P "$2" \
+        --capture-props='stream.capture.sink=true node.passive=true' \
+        --playback-props='node.dont-reconnect=true'
+) >> "$LOG" 2>&1 < /dev/null &
+echo $! > "$PIDF"

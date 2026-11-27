@@ -15,7 +15,7 @@
     the connection, never by anything the client says about itself.
   </description>
 
-  <interface name="pixi_shell_v1" version="1">
+  <interface name="pixi_shell_v1" version="4">
     <description summary="control of the session's windows">
       The shell's own window is an ordinary xdg_toplevel. The compositor keeps
       it the size of the display and decides, from the mode below, whether it
@@ -49,6 +49,26 @@
     <request name="kill">
       <description summary="end the process behind one application window"/>
       <arg name="id" type="uint"/>
+    </request>
+
+    <request name="preview">
+      <description summary="show a live, scaled picture of an application window">
+        Draws the window's current contents into the given rectangle, in
+        display coordinates, on top of the shell. The shell uses this for the
+        app switcher. Sending it again for the same window moves or resizes
+        the picture. Pictures not sent again before the next previews_flush
+        are removed. Windows that aren't shown or have gone away are ignored.
+      </description>
+      <arg name="id" type="uint"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="opacity" type="uint" summary="0 to 1000"/>
+    </request>
+
+    <request name="previews_flush">
+      <description summary="remove previews that weren't refreshed since the last flush"/>
     </request>
 
     <request name="quit">
@@ -91,5 +111,68 @@
         pressed.
       </description>
     </event>
+
+    <request name="key" since="2">
+      <description summary="type a key into the front application">
+        Sends a key press or release to the front application window, as if it
+        came from a keyboard, for the shell's on-screen keyboard. Ignored unless
+        an application is in front in app mode. The keycode is an evdev code
+        (KEY_A is 30). modifiers holds the xkb modifier bits held down: 1 Shift,
+        4 Control, 8 Alt.
+      </description>
+      <arg name="keycode" type="uint"/>
+      <arg name="modifiers" type="uint"/>
+      <arg name="state" type="uint" summary="1 pressed, 0 released"/>
+    </request>
+
+    <request name="pointer_move" since="3">
+      <description summary="move the pointer">
+        Moves the pointer by a distance in display pixels, as if a mouse had,
+        for the shell's gamepad-as-mouse mode. The pointer is drawn and sent
+        to whichever window is under it. Ignored unless an application is in
+        front in app mode.
+      </description>
+      <arg name="dx" type="fixed"/>
+      <arg name="dy" type="fixed"/>
+    </request>
+
+    <request name="pointer_button" since="3">
+      <description summary="press or release a pointer button">
+        Sends a button press or release to the window under the pointer.
+        The button is an evdev code (BTN_LEFT is 272, BTN_RIGHT 273,
+        BTN_MIDDLE 274). Ignored unless an application is in front in app mode.
+      </description>
+      <arg name="button" type="uint"/>
+      <arg name="state" type="uint" summary="1 pressed, 0 released"/>
+    </request>
+
+    <request name="pointer_scroll" since="3">
+      <description summary="scroll the window under the pointer">
+        Scrolls by an amount in wheel notches, positive being down and to
+        the right. Ignored unless an application is in front in app mode.
+      </description>
+      <arg name="dx" type="fixed"/>
+      <arg name="dy" type="fixed"/>
+    </request>
+
+    <request name="pointer_visible" since="3">
+      <description summary="show or hide the pointer image">
+        The pointer is shown the first time it moves. The shell hides it again
+        when it leaves gamepad-as-mouse mode.
+      </description>
+      <arg name="visible" type="uint" summary="1 shown, 0 hidden"/>
+    </request>
+
+    <request name="screenshot" since="4">
+      <description summary="save the picture of an application's window">
+        Writes the window's current picture to a file as a binary PPM (P6),
+        for the shell's screenshot button, which turns it into a PNG. The
+        file appears all at once, under its final name, when it is complete;
+        if the picture can't be read, nothing is written. The path must be
+        absolute. Ignored for the shell's own window.
+      </description>
+      <arg name="id" type="uint" summary="the window"/>
+      <arg name="path" type="string" summary="where to write the PPM"/>
+    </request>
   </interface>
 </protocol>

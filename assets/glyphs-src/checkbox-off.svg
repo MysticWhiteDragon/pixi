@@ -1,0 +1,4 @@
+<!-- An unticked box: just the square, with nothing in it. The pair with checkbox-on.svg is one mark in two states. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect x="5.2" y="5.2" width="21.6" height="21.6" rx="4.6" fill="none" stroke="#ffffff" stroke-width="3.2"/>
+</svg>
