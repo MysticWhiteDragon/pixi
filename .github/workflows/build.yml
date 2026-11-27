@@ -21,6 +21,9 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential pkg-config libwlroots-0.18-dev libwayland-dev wayland-protocols \
             libxkbcommon-dev libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libsdl2-mixer-dev libgles-dev libvlc-dev libqrencode-dev
+      - name: Remove generated protocol files
+        # they are made from protocol/*.xml; a stale copy that was committed would be taken as up to date
+        run: rm -f compositor/*-protocol.[ch] shell/*-protocol.[ch]
       - name: Build
         # The version is the build date, in UTC (YYYY.MM.DD), set by the Makefiles.
         run: make CFLAGS="-O2 -g -Werror"
