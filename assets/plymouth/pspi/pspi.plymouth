@@ -1,8 +1,0 @@
-[Plymouth Theme]
-Name=PSPi
-Description=The PSPi start, shutdown and restart screens
-ModuleName=script
-
-[script]
-ImageDir=/usr/share/plymouth/themes/pspi
-ScriptFile=/usr/share/plymouth/themes/pspi/pspi.script

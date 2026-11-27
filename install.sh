@@ -75,7 +75,7 @@ say "Installing build tools and libraries"
 apt-get install -y --no-install-recommends \
     build-essential pkg-config \
     libwlroots-0.18-dev libwayland-dev wayland-protocols libxkbcommon-dev \
-    libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libsdl2-mixer-dev libgles-dev libqrencode-dev
+    libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libsdl2-mixer-dev libgles-dev libqrencode-dev libvlc-dev libpam0g-dev
 
 say "Installing graphics, fonts, audio, networking and session services"
 apt-get install -y --no-install-recommends \
